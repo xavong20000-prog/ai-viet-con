@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Logo AI Việt Côn: huy hiệu tròn xanh lá mạ, ngôi sao vàng, hai lá mạ ôm bên dưới. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8FD14F"/>
+      <stop offset="1" stop-color="#4E9F2A"/>
+    </linearGradient>
+    <linearGradient id="star" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFE45C"/>
+      <stop offset="1" stop-color="#FFC107"/>
+    </linearGradient>
+  </defs>
+  <circle cx="256" cy="256" r="248" fill="#FFD21F"/>
+  <circle cx="256" cy="256" r="226" fill="url(#bg)"/>
+  <!-- ngôi sao 5 cánh -->
+  <g transform="translate(256 215) scale(0.80) translate(-256 -237)"><polygon fill="url(#star)" stroke="#E6A800" stroke-width="6" stroke-linejoin="round"
+    points="256,70 299,195 431,197 326,277 364,404 256,328 148,404 186,277 81,197 213,195"/>
+  <text x="256" y="285" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-weight="bold" font-size="96" fill="#2F6B16">AI</text></g>
+  <!-- hai lá mạ -->
+  <path d="M256 462 C 210 445, 160 420, 140 375 C 190 385, 235 415, 256 462 Z" fill="#E8F7C8"/>
+  <path d="M256 462 C 302 445, 352 420, 372 375 C 322 385, 277 415, 256 462 Z" fill="#E8F7C8"/>
+  <path d="M256 462 C 225 440, 185 412, 150 380" stroke="#4E9F2A" stroke-width="5" fill="none" stroke-linecap="round"/>
+  <path d="M256 462 C 287 440, 327 412, 362 380" stroke="#4E9F2A" stroke-width="5" fill="none" stroke-linecap="round"/>
+</svg>

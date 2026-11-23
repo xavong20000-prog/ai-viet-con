@@ -1,0 +1,447 @@
+# ============================================================================
+# Javis OS - HOSTINGER VPS (Docker Manager). Domain + HTTPS through Hostinger's Traefik, or through
+# the bundled Caddy (service gateway) on a VPS without Traefik (plain Ubuntu 26 template).
+#
+# This file ALWAYS deploys:
+#   - DOMAIN_NAME empty -> runs, the Open button opens http://<ip>:7777 (no HTTPS yet).
+#   - DOMAIN_NAME set   -> HTTPS for that name.
+#
+# HOW TO USE
+#   1) Docker Manager > Compose > URL > paste:
+#      https://raw.githubusercontent.com/blogminhquy/javis-os/main/docker-compose.hostinger.yml
+#   2) Environment box, four useful fields: DOMAIN_NAME, JAVIS_ADMIN_USER, JAVIS_ADMIN_PASSWORD,
+#      JAVIS_AUTO_UPDATE (true = Javis updates itself daily; empty = "Update now" in the app).
+#      DOMAIN_NAME, to get HTTPS:
+#        - free link, no domain to buy:  DOMAIN_NAME=javis.<vps-hostname>.hstgr.cloud
+#          (the hostname is under hPanel > VPS, e.g. DOMAIN_NAME=javis.srv1782015.hstgr.cloud)
+#        - your own domain:  DOMAIN_NAME=example.com  (point its DNS A record at the VPS IP first)
+#   3) Deploy, wait 1-3 minutes for the certificate, open  https://<DOMAIN_NAME>.
+#
+# No Environment box? Press Manage, edit the .yaml, change the labels traefik.enable and ...rule to:
+#      - traefik.enable=true
+#      - traefik.http.routers.javis.rule=Host(`javis.srv1782015.hstgr.cloud`)   (your VPS hostname)
+# VPS hostname unknown? Open http://<ip>:7777 > Settings > Domain: Javis shows the DOMAIN_NAME=... line.
+#
+# NOTES
+#   - Declare NO networks: Hostinger's Traefik finds the container through its labels.
+#   - Update: "Update now" in the app (needs the watchtower service below), or Redeploy.
+#   - VPS without Traefik: same link. The gateway service sees ports 80/443 free and serves HTTPS
+#     with Caddy. Needs Docker and ports 80, 443 open in the firewall.
+#   - Not a Hostinger VPS: use docker-compose.yml + docker-compose.https.yml instead.
+#   - The GHCR image must be PUBLIC.
+#   - A second Javis on the same VPS: see the end of this file.
+#   - hPanel refuses a compose over 32,768 characters, so this file stays small: short ASCII
+#     comments here, the reasons in docs/dev/hostinger-compose.md
+#     (tests/python/test_hostinger_compose_size.py guards the size).
+# ============================================================================
+services:
+  javis:
+    image: ghcr.io/blogminhquy/javis-os:latest
+    # Container, Traefik router and service are all named after JAVIS_NAME (empty = "javis").
+    # A second instance on the same VPS needs another name, e.g. javis-shop.
+    container_name: ${JAVIS_NAME:-javis}
+    restart: unless-stopped
+    pull_policy: always
+    # The Hostinger target is set inside the command so it does not become an Environment field.
+    command: ["sh", "-c", "JAVIS_DEPLOY_TARGET=hostinger exec python -m uvicorn main:app --app-dir server --host 0.0.0.0 --port 7777"]
+    environment:
+      # Only what the installer needs. Port, paths, state and brain have defaults in the image.
+      DOMAIN_NAME: ${DOMAIN_NAME:-localhost}
+      JAVIS_ADMIN_USER: ${JAVIS_ADMIN_USER:-admin}
+      JAVIS_ADMIN_PASSWORD: ${JAVIS_ADMIN_PASSWORD:-}
+      # Same token as the watchtower service below, so "Update now" can call it. Hard-coded on
+      # purpose: every ${...} adds a field to the Environment form, and port 8080 is never published.
+      WATCHTOWER_TOKEN: javis-update
+    ports:
+      # Fallback entry (Open button, http://<ip>:7777). A second instance must change the port
+      # (JAVIS_HOST_PORT=7778). With DOMAIN_NAME set it listens on 127.0.0.1 only, so the password
+      # never travels over plain http. Locked out? Clear DOMAIN_NAME and Redeploy: it opens again.
+      - "${DOMAIN_NAME:+127.0.0.1:}${JAVIS_HOST_PORT:-7777}:7777"
+    labels:
+      # Guide links shown in Docker Manager.
+      - org.opencontainers.image.documentation=https://github.com/blogminhquy/javis-os/blob/main/docs/README.md
+      - org.opencontainers.image.source=https://github.com/blogminhquy/javis-os
+      - com.hostinger.documentation=https://github.com/blogminhquy/javis-os/blob/main/docs/README.md
+      - com.hostinger.quickstart=https://github.com/blogminhquy/javis-os/blob/main/QUICKSTART.md
+      # Router and service carry the instance name: Traefik router names are machine-wide. With
+      # DOMAIN_NAME empty the two labels below are empty, so Traefik skips the container and hPanel's
+      # Open button falls back to http://<ip>:7777 instead of localhost.
+      - traefik.enable=${DOMAIN_NAME:+true}
+      - traefik.http.routers.${JAVIS_NAME:-javis}.rule=${DOMAIN_NAME:+Host(`}${DOMAIN_NAME:-}${DOMAIN_NAME:+`)}
+      - traefik.http.routers.${JAVIS_NAME:-javis}.entrypoints=websecure
+      - traefik.http.routers.${JAVIS_NAME:-javis}.tls.certresolver=letsencrypt
+      - traefik.http.routers.${JAVIS_NAME:-javis}.service=${JAVIS_NAME:-javis}
+      - traefik.http.services.${JAVIS_NAME:-javis}.loadbalancer.server.port=7777
+    volumes:
+      - javis-data:/data
+      - javis-brains:/brains
+      - claude-auth:/home/javis/.claude
+      - codex-auth:/home/javis/.codex
+      - gateway-status:/gateway:ro   # what the gateway service is doing (read only)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,os,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.getenv('JAVIS_PORT','7777')+'/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+
+  # ------------------------------------------------------------------------
+  # One-click update from the app ("Update now"). Uses the maintained fork nicholas-fedor/watchtower,
+  # pinned to major 1: the old containrrr image speaks Docker API 1.25, which current Docker refuses.
+  # Javis keeps running if this container fails: then update with Redeploy. Logs: `javis-watchtower`.
+  watchtower:
+    image: ghcr.io/nicholas-fedor/watchtower:1
+    container_name: ${JAVIS_NAME:-javis}-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_HTTP_API_ENDPOINTS: update                 # takes the update call from the button
+      WATCHTOWER_HTTP_API_TOKEN: javis-update               # matches WATCHTOWER_TOKEN above
+      # Updates on its own, without the button. The installer's choice (fourth Environment field):
+      # Javis then restarts whenever a new version exists, cutting running work. Empty = off.
+      WATCHTOWER_HTTP_API_PERIODIC_POLLS: ${JAVIS_AUTO_UPDATE:-false}
+      WATCHTOWER_POLL_INTERVAL: 86400                       # 24h, only when the line above is on
+      WATCHTOWER_CLEANUP: "true"                            # removes the old image after an update
+      # Pull + removal of the old container; the default 10m ran out on a slow disk (see `guard`).
+      WATCHTOWER_HTTP_API_UPDATE_TIMEOUT: 30m
+    # Internal container: nothing to expose.
+    labels:
+      - traefik.enable=false
+    # Watches THIS instance's container only (a fixed "javis" would restart another instance).
+    command: ${JAVIS_NAME:-javis}
+
+  # ------------------------------------------------------------------------
+  # Brings Javis back when an update leaves it gone (404) or stopped, after 2 minutes; a Javis you stop
+  # by hand is left alone. Docker socket only, no network. Logs: container `javis-guard`. Below is a
+  # compact copy of docker/guard.py (explained there), written by tools/sync_guard.py: edit that file.
+  guard:
+    image: python:3.12-alpine
+    container_name: ${JAVIS_NAME:-javis}-guard
+    restart: unless-stopped
+    network_mode: none
+    depends_on:
+      - javis          # deleting the stack stops the guard first, so it never sees Javis "vanish"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - guard-data:/guard
+    environment:
+      JAVIS_NAME: ${JAVIS_NAME:-javis}
+    labels:
+      - traefik.enable=false
+    entrypoint: ["python", "-u", "-c"]
+    command:
+      - |
+        import http.client
+        import json
+        import os
+        import signal
+        import socket
+        import sys
+        import time
+        import urllib.parse
+        NAME = os.environ.get("JAVIS_NAME") or "javis"
+        SOCKET = os.environ.get("JAVIS_GUARD_SOCKET") or "/var/run/docker.sock"
+        STORE = os.environ.get("JAVIS_GUARD_DIR") or "/guard"
+        EVERY = float(os.environ.get("JAVIS_GUARD_EVERY") or 15)
+        GRACE = float(os.environ.get("JAVIS_GUARD_GRACE") or 120)
+        def log(msg):
+          print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "[guard]", msg, flush=True)
+        class DockerConnection(http.client.HTTPConnection):
+          def __init__(self, timeout):
+            super().__init__("localhost", timeout=timeout)
+          def connect(self):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            sock.connect(SOCKET)
+            self.sock = sock
+        def api(method, path, body=None, timeout=60):
+          conn = DockerConnection(timeout)
+          try:
+            data = None if body is None else json.dumps(body).encode()
+            conn.request(method, path, body=data, headers={"Content-Type": "application/json"} if data else {})
+            resp = conn.getresponse()
+            raw = resp.read()
+          finally:
+            conn.close()
+          try:
+            return resp.status, json.loads(raw) if raw else None
+          except ValueError:
+            return resp.status, raw.decode("utf-8", "replace")
+        def quote(value):
+          return urllib.parse.quote(value, safe="")
+        def tag_image_id(ref):
+          status, body = api("GET", "/images/" + ref + "/json")
+          return body.get("Id") if status == 200 and isinstance(body, dict) else None
+        def endpoint(ep, cid, network):
+          out = {}
+          aliases = [a for a in ep.get("Aliases") or [] if a not in (cid, cid[:12])]
+          if aliases and network != "bridge":
+            out["Aliases"] = aliases
+          for key in ("IPAMConfig", "Links", "DriverOpts"):
+            if ep.get(key):
+              out[key] = ep[key]
+          return out
+        def create_spec(snap):
+          c, img = snap["container"], snap.get("image") or {}
+          cid = c["Id"]
+          cfg = json.loads(json.dumps(c["Config"]))
+          host = json.loads(json.dumps(c["HostConfig"]))
+          for key, empty in (("WorkingDir", ""), ("User", ""), ("Cmd", None), ("Entrypoint", None),
+                   ("Healthcheck", None), ("StopSignal", "")):
+            if key in cfg and cfg.get(key) == img.get(key):
+              cfg[key] = empty
+          cfg["Env"] = [e for e in cfg.get("Env") or [] if e not in (img.get("Env") or [])]
+          old_labels = img.get("Labels") or {}
+          cfg["Labels"] = {k: v for k, v in (cfg.get("Labels") or {}).items() if old_labels.get(k) != v}
+          for key in ("Volumes", "ExposedPorts"):
+            cfg[key] = {k: v for k, v in (cfg.get(key) or {}).items() if k not in (img.get(key) or {})} or None
+          if cfg.get("Hostname") == cid[:12]:
+            cfg["Hostname"] = ""
+          cfg.pop("MacAddress", None)
+          taken = {m.get("Target") for m in host.get("Mounts") or []}
+          taken |= {b.split(":")[1] for b in host.get("Binds") or [] if ":" in b}
+          for m in c.get("Mounts") or []:
+            if m.get("Type") == "volume" and m.get("Name") and m.get("Destination") not in taken:
+              bind = m["Name"] + ":" + m["Destination"] + ("" if m.get("RW", True) else ":ro")
+              host["Binds"] = (host.get("Binds") or []) + [bind]
+          networks = (c.get("NetworkSettings") or {}).get("Networks") or {}
+          mode = host.get("NetworkMode") or ""
+          extra = {}
+          cfg["HostConfig"] = host
+          if mode in ("host", "none") or mode.startswith("container:") or not networks:
+            return cfg, extra
+          primary = mode if mode in networks else next(iter(networks))
+          cfg["NetworkingConfig"] = {"EndpointsConfig": {primary: endpoint(networks[primary], cid, primary)}}
+          for net, ep in networks.items():
+            if net != primary:
+              extra[net] = endpoint(ep, cid, net)
+          return cfg, extra
+        def pull(ref):
+          image, _, tag = ref.rpartition(":")
+          if not image or "/" in tag or "@" in ref:
+            image, tag = ref, ""
+          query = "fromImage=" + quote(image) + ("&tag=" + quote(tag) if tag else "")
+          status, _ = api("POST", "/images/create?" + query, timeout=1800)
+          log("pull " + ref + ": HTTP " + str(status))
+        def create(snap, body):
+          new_image = tag_image_id(body.get("Image") or "")
+          if new_image and body["Labels"].get("com.docker.compose.image") == snap["container"].get("Image"):
+            body["Labels"]["com.docker.compose.image"] = new_image
+          return api("POST", "/containers/create?name=" + quote(NAME), body, timeout=300)
+        def recreate(snap):
+          body, extra = create_spec(snap)
+          status, resp = create(snap, body)
+          if status == 404:
+            pull(body.get("Image") or "")
+            status, resp = create(snap, body)
+          if status == 409:
+            log("the name " + NAME + " is taken again (Watchtower may have made it meanwhile): leaving it")
+            return False
+          if status != 201:
+            log("create failed: HTTP " + str(status) + " " + str(resp))
+            return False
+          new_id = resp["Id"]
+          for net, ep in extra.items():
+            s, r = api("POST", "/networks/" + net + "/connect", {"Container": new_id, "EndpointConfig": ep})
+            if s != 200:
+              log("connect to network " + net + " failed: HTTP " + str(s) + " " + str(r))
+          return start(new_id)
+        def start(ref):
+          status, resp = api("POST", "/containers/" + ref + "/start", timeout=300)
+          if status in (204, 304):
+            log("started " + NAME)
+            return True
+          log("start failed: HTTP " + str(status) + " " + str(resp))
+          return False
+        def snapshot_path():
+          return os.path.join(STORE, NAME + ".json")
+        def load_snapshot():
+          try:
+            with open(snapshot_path(), encoding="utf-8") as f:
+              return json.load(f)
+          except (OSError, ValueError):
+            return None
+        def save_snapshot(snap):
+          try:
+            os.makedirs(STORE, exist_ok=True)
+            tmp = snapshot_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+              json.dump(snap, f)
+            os.replace(tmp, snapshot_path())
+          except OSError as e:
+            log("could not save the snapshot (kept in memory only): " + str(e))
+        class Guard:
+          def __init__(self, now=time.monotonic):
+            self.now = now
+            self.snap = load_snapshot()
+            self.since = None
+          def check(self):
+            status, c = api("GET", "/containers/" + NAME + "/json")
+            if status == 404:
+              return self.missing()
+            if status != 200 or not isinstance(c, dict):
+              return "unknown"
+            state = (c.get("State") or {}).get("Status") or ""
+            if state in ("running", "restarting", "paused", "removing"):
+              self.since = None
+              snap = self.snap or {}
+              if state == "running" and (snap.get("container", {}).get("Id") != c["Id"] or snap.get("owner_stopped")):
+                s, img = api("GET", "/images/" + c["Image"] + "/json")
+                self.snap = {"container": c, "image": (img or {}).get("Config") if s == 200 else None}
+                save_snapshot(self.snap)
+                log("watching " + NAME + " (" + c["Id"][:12] + ")")
+              return "ok"
+            return self.not_running(c, state)
+          def waited(self):
+            if self.since is None:
+              self.since = self.now()
+            return self.now() - self.since >= GRACE
+          def missing(self):
+            if not self.snap or not self.waited():
+              return "waiting" if self.snap else "no-snapshot"
+            log(NAME + " has been gone for " + str(int(GRACE)) + "s (an update stopped halfway?): creating it again")
+            self.since = None
+            return "recreated" if recreate(self.snap) else "failed"
+          def not_running(self, c, state):
+            if c["Id"] == (self.snap or {}).get("owner_stopped"):
+              return "owner-stopped"
+            seen = (self.snap or {}).get("container", {}).get("Id")
+            if state == "dead":
+              if not self.snap or not self.waited():
+                return "waiting"
+              log(NAME + " is dead (a removal broke halfway): removing it and creating it again")
+              api("DELETE", "/containers/" + c["Id"] + "?force=1", timeout=300)
+              self.since = None
+              return "recreated" if recreate(self.snap) else "failed"
+            if c["Id"] == seen and state == "exited":
+              ref = (c.get("Config") or {}).get("Image") or ""
+              if self.since is None and tag_image_id(ref) == c.get("Image"):
+                self.snap["owner_stopped"] = c["Id"]
+                save_snapshot(self.snap)
+                return "owner-stopped"
+              if not self.waited():
+                return "waiting"
+              log(NAME + " was stopped by an update that never finished: starting it again")
+            elif state == "created" and c["Id"] != seen:
+              if not self.waited():
+                return "waiting"
+              log(NAME + " was created but never started: starting it")
+            else:
+              return "left-alone"
+            self.since = None
+            return "started" if start(c["Id"]) else "failed"
+        def main():
+          signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+          log("guarding container " + NAME + " (checks every " + str(int(EVERY)) + "s, acts after " + str(int(GRACE)) + "s)")
+          guard = Guard()
+          while True:
+            try:
+              guard.check()
+            except Exception as e:
+              log("check failed: " + type(e).__name__ + ": " + str(e))
+            time.sleep(EVERY)
+        if __name__ == "__main__":
+          main()
+
+  # ------------------------------------------------------------------------
+  # HTTPS on a VPS WITHOUT Hostinger's Traefik. One link works on both templates:
+  #   - another proxy holds 80/443 (Hostinger's Traefik) -> the gateway stays idle, Traefik serves SSL.
+  #   - 80/443 free (plain Ubuntu 26) -> the gateway runs Caddy: Let's Encrypt for DOMAIN_NAME, then
+  #     forwards to Javis on the instance's host port.
+  #   - DOMAIN_NAME empty -> it uses the VPS's own name when it has one, else it stays idle.
+  # Host networking on purpose: publishing 80/443 next to Traefik fails the whole deploy with "port is
+  # already allocated". The script checks the ports itself and looks again every 10 minutes.
+  # Caddy asks a certificate for exactly DOMAIN_NAME (never on demand). Several instances on a VPS
+  # without Traefik: the first gateway holds 80/443, later ones use docker-compose.proxy.yml (DEPLOY.md).
+  gateway:
+    image: caddy:2-alpine
+    container_name: ${JAVIS_NAME:-javis}-gateway
+    restart: unless-stopped
+    network_mode: host
+    # 0.302.0: the VPS's own hostname (srv<id>.hstgr.cloud) is visible here, so with DOMAIN_NAME empty the gateway
+    # still gets a link: javis.srv<id>.hstgr.cloud. Hostinger never tells a pasted compose that name at install time.
+    uts: host
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME:-localhost}
+      JAVIS_HOST_PORT: ${JAVIS_HOST_PORT:-7777}
+      JAVIS_NAME: ${JAVIS_NAME:-javis}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        D="$${DOMAIN_NAME:-localhost}"
+        P="$${JAVIS_HOST_PORT:-7777}"
+        nghi() { while :; do sleep 3600; done; }
+        S="/status/gateway.txt"
+        ghi() { mkdir -p /status 2>/dev/null; printf 'state=%s\nnames=%s\n' "$$1" "$$2" > "$$S" 2>/dev/null || true; }
+        # Chua dat DOMAIN_NAME: lay ten VPS Hostinger (srv<so>.hstgr.cloud) lam link. 0.304.0: KHONG doan qua DNS nua.
+        # Ban 0.302.0 so dia chi bang getent, ma getent doc /etc/hosts cua VPS truoc (Ubuntu ghi ten may -> 127.0.1.1),
+        # nen Caddy xin cert cho srv<so>.hstgr.cloud con Javis lai cho javis.srv<so>.hstgr.cloud: lech nhau, khong ai
+        # duoc chuyen sang https (chu repo bao 24/10/2026). Gio Caddy phuc vu CA HAI ten (<ten-ban>.<may> va, voi ban
+        # mac dinh, chinh ten may); ten nao DNS tro ve may thi co cert. Danh sach ghi vao $$S de Javis thu dung cac ten nay.
+        if [ "$$D" = "localhost" ] || [ -z "$$D" ]; then
+          M="$$( (hostname -f 2>/dev/null || hostname) | tr 'A-Z' 'a-z')"
+          case "$$M" in
+            *.hstgr.cloud) ;;
+            srv[0-9]*) case "$$M" in *.*) M="";; *) M="$$M.hstgr.cloud";; esac;;
+            *) M="";;
+          esac
+          N="$$(echo "$${JAVIS_NAME:-javis}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-\n' '-')"
+          if [ -n "$$M" ]; then
+            D="$$N.$$M"
+            [ "$$N" = "javis" ] && D="$$D $$M"
+            echo "[gateway] Chua dat DOMAIN_NAME: dung link cua VPS $$D"
+          fi
+        fi
+        case "$$D" in
+          ""|localhost) echo "[gateway] DOMAIN_NAME chua dat: khong cap HTTPS, vao bang http://<ip>:$$P"; ghi idle ""; nghi;;
+        esac
+        for x in $$D; do
+          case "$$x" in
+            *[!A-Za-z0-9.-]*|*.|.*) echo "[gateway] Ten mien khong hop le: $$x. Khong cap HTTPS."; ghi idle ""; nghi;;
+          esac
+        done
+        # 0050 = cong 80, 01BB = cong 443, 0A = dang LISTEN. Them nc cho truong hop Docker chi dung iptables.
+        ban() {
+          grep -qiE ':(0050|01BB) [0-9A-F]+:[0-9A-F]+ 0A' /proc/net/tcp /proc/net/tcp6 2>/dev/null && return 0
+          nc -z -w 2 127.0.0.1 443 2>/dev/null || nc -z -w 2 127.0.0.1 80 2>/dev/null
+        }
+        while ban; do
+          echo "[gateway] Cong 80/443 da co proxy khac (Traefik cua Hostinger): de no cap HTTPS cho $$D. Soi lai sau 10 phut."
+          ghi busy "$$D"
+          sleep 600
+        done
+        echo "[gateway] Khong co Traefik: Caddy cap HTTPS cho $$D -> 127.0.0.1:$$P"
+        echo "[gateway] Chung chi khong len? Mo cong 80 va 443 o hPanel > VPS > Tuong lua."
+        ghi serving "$$D"
+        printf '%s {\n\treverse_proxy 127.0.0.1:%s\n}\n' "$$(echo $$D | sed 's/ /, /g')" "$$P" > /config/Caddyfile
+        exec caddy run --config /config/Caddyfile --adapter caddyfile
+    volumes:
+      - gateway-data:/data       # issued certificates, kept across Redeploy (no new request)
+      - gateway-config:/config
+      # The gateway writes its state here (idle / busy / serving + names); Javis reads it (read only).
+      - gateway-status:/status
+    labels:
+      - traefik.enable=false
+
+# ============================================================================
+# SEVERAL JAVIS INSTANCES ON ONE HOSTINGER VPS
+# Deploy this compose once more (a new stack in Docker Manager) and change ALL THREE:
+#   Stack 1:  DOMAIN_NAME=shop.srv1782015.hstgr.cloud  JAVIS_NAME=(empty)     JAVIS_HOST_PORT=(empty)
+#   Stack 2:  DOMAIN_NAME=home.srv1782015.hstgr.cloud  JAVIS_NAME=javis-home  JAVIS_HOST_PORT=7778
+# Same JAVIS_NAME -> Docker says the container name is in use; same JAVIS_HOST_PORT -> port taken;
+# same DOMAIN_NAME -> two instances fight over one link. Any *.hstgr.cloud subdomain resolves at once.
+# Each stack has its own volumes: state, brain, admin account and Claude sign-in are separate, so
+# sign in to Claude once per instance (that stack's App terminal).
+# ============================================================================
+
+volumes:
+  guard-data:
+  gateway-status:
+  gateway-data:
+  gateway-config:
+  javis-data:
+  javis-brains:
+  claude-auth:
+  codex-auth:

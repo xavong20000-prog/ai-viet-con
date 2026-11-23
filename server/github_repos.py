@@ -1,0 +1,1398 @@
+"""GitHub connection and the repos a brain works on (spec docs/dev/2026-10-github-trong-chat-spec.md, phase G1).
+
+What lives here:
+  1. The ONE GitHub connection of this AI Việt Côn (section 5.1). It is built into the core: the Connections page always
+     shows it, no Store pack, no MCP. The token is stored encrypted (`secrets_store`), or the connection points at the
+     brain-backup token (`settings.backup.token`) after a check, so a person who already set up backup has nothing to
+     paste twice. One connection per install rather than per brain: the backup token is per install too, and a second
+     account per brain has no user asking for it yet (the spec said per brain; corrected there).
+  2. The repo registry: which GitHub repos a brain has cloned, and where. Clones live OUTSIDE the brain tree
+     (`STATE_DIR/repos/<brain>/<owner>/<repo>`, section 4.3): the brain is synced to GitHub and indexed, so code inside
+     it would leak into the brain backup and flood search.
+  3. Attaching repos to a conversation. Each attached repo gets a worktree of its own for that conversation, on a new
+     branch `javis/<session>`, so two conversations never edit the same files (section 6). The coding_store binding is
+     the single source of truth for which folders a conversation works in; this module only adds GitHub repos to it.
+  4. The two ways to let go of a repo (section 5.3): detach from one chat (the clone stays) and remove from the brain
+     (the local clone and its worktrees are deleted, GitHub is never touched). Removal refuses while work could be lost.
+
+Git authentication never goes through argv or the remote URL: the token rides in `GIT_CONFIG_*` environment variables
+as an HTTP header, only for AI Việt Côn's own git calls (`auth=True`). The clone's `origin` stays the clean https URL, so a
+model running shell commands in the worktree finds no credential on disk to push with (section 4.1: the model never
+pushes, AI Việt Côn does).
+
+Threat model of those authenticated calls (decided 12/11/2026). A chat's worktree shares the clone's `.git`, and the
+model has a shell there, so everything under `.git` is written by code AI Việt Côn did not choose: the model, and whatever it
+runs (an `npm install` that sets `core.hooksPath`, husky style, is the everyday case). git hands its whole
+environment, token included, to every program it starts, and applies an unscoped header to every URL. So a call that
+carries the token treats the repo's hooks and its repo-level config (`.git/config`, `config.worktree`, whatever they
+include) as UNTRUSTED, and `auth_env` isolates the call from them:
+  - Hooks never run in it: `core.hooksPath` points at an empty folder of AI Việt Côn's own (`NO_HOOKS_DIR`).
+  - The header is scoped to one URL (`http.<url>.extraheader`): the origin GitHub's API named, read from AI Việt Côn's
+    registry and never from the clone's config. A redirected `origin` gets no token.
+  - Settings that start a program are switched off for the call (`ISOLATION`), repo-level filter drivers are replaced
+    by the machine's own or emptied, and only the origin's protocol is allowed (no `ext::`, no helper of the repo's).
+  - Repo-level settings that steer the connection and cannot be overridden (`url.*.insteadOf`, `http.proxy`,
+    `include.path`, a changed `remote.origin.url`...) make the call refuse, naming them, instead of running.
+Trusted: the machine's own git config (system and global), PATH and the environment of the AI Việt Côn process.
+NOT a boundary: a program running as AI Việt Côn's OS user that goes after the token on purpose. It can read STATE_DIR
+(settings plus `.secret_key`) or the environment of a running git. This isolation stops the token leaking THROUGH git;
+it does not sandbox the model. git itself has no supported way to hold a secret inside a repository it does not trust,
+so the lists below are the known routes, not a proof; the stronger design runs the token-bearing calls from a git dir
+of AI Việt Côn's own that a worktree cannot write to.
+
+Stdlib plus httpx (through github_api), no FastAPI, no main import.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import brain_ident
+import coding_store
+import git_setup
+import localefmt
+import winproc
+from config import STATE_DIR
+from github_api import GitHub, GitHubError
+
+REPOS_DIR = STATE_DIR / "repos"
+STORE_PATH = STATE_DIR / "github.json"
+GIT_TIMEOUT = 60
+CLONE_TIMEOUT = 600
+_lock = threading.RLock()
+# Serialises git work per clone: two chats attaching the same repo at once must not run two `git worktree add` in it.
+_repo_locks: Dict[str, threading.Lock] = {}
+SOURCE = "github"
+# Slow-changing list: cache the account's repos for a minute so typing in the search box costs no API calls.
+_REPO_CACHE: Dict[str, Any] = {"at": 0.0, "token": "", "items": []}
+REPO_CACHE_S = 60.0
+
+
+class RepoError(Exception):
+    """A failure worth showing as is (already localized).
+
+    `code` names a failure the dashboard answers itself instead of only printing the sentence ("work_at_risk": it asks
+    whether to detach anyway); `data` carries what it needs for that. Both go out next to `error` (routes/github.py).
+    """
+
+    def __init__(self, msg: str = "", code: str = "", data: Optional[Dict[str, Any]] = None):
+        super().__init__(msg)
+        self.code = code
+        self.data = dict(data or {})
+
+
+def _c(vi: str, en: str) -> str:
+    return localefmt.chu(vi, en)
+
+
+def _now() -> float:
+    return time.time()
+
+
+# ============================================================
+# Settings: the connection
+# ============================================================
+def _settings():
+    import config as cfgmod
+    return cfgmod
+
+
+def _read_conn() -> Dict[str, Any]:
+    return dict((_settings().read_settings().get("github") or {}))
+
+
+def _write_conn(conn: Dict[str, Any]) -> None:
+    """Replace the whole `github` section. The token is encrypted at rest by config (`github.token` is in
+    `_SECRET_PATHS`), so it is written here in clear and never by hand-rolled crypto."""
+    empty = {"source": "", "token": "", "refresh_token": "", "expires_at": 0, "login": "", "user_id": 0, "missing": [],
+             "connected_at": 0}
+    _settings().update_settings({"github": {**empty, **(conn or {})}})
+
+
+_SOURCE_NAMES = {"own": "token", "app": "sign-in", "backup": "backup token"}
+
+
+def _conn_label(conn: Dict[str, Any]) -> str:
+    login = str(conn.get("login") or "").strip()
+    src = str(conn.get("source") or "")
+    return f"@{login or '?'} ({_SOURCE_NAMES.get(src, src or '?')})"
+
+
+def _log_conn_change(before: Dict[str, Any], after: Dict[str, Any], who: Optional[Dict[str, str]]) -> None:
+    """One line in the security log when the connection is made, swapped for another account or removed.
+
+    Owner incident 2026-11-22: GitHub was found signed out after a stranger took over the AI Việt Côn account, and nothing
+    told who did it. `who` is {ip, ua, user} of the request (routes/github.py); a call from code has none and is
+    marked "internal". Reconnecting the same account and a token renewal are not changes and write nothing. Never
+    records the token."""
+    had = bool(before.get("source"))
+    has = bool(after.get("source"))
+    if had and has:
+        if (before.get("login"), before.get("source")) == (after.get("login"), after.get("source")):
+            return
+        event, detail = "github_changed", f"{_conn_label(after)}, was {_conn_label(before)}"
+    elif has:
+        event, detail = "github_connected", _conn_label(after)
+    elif had:
+        event, detail = "github_disconnected", _conn_label(before)
+    else:
+        return
+    who = who or {}
+    try:
+        import security_log
+        security_log.record(event, ip=who.get("ip", ""), ua=who.get("ua", ""), user=who.get("user", ""),
+                            detail=detail, source="" if who else "internal")
+    except Exception as e:  # noqa: BLE001 - the log must never undo a connect or disconnect the person asked for
+        print(f"[github] security log: {type(e).__name__}: {e}", file=sys.stderr)
+
+
+def backup_token() -> str:
+    return str(((_settings().read_settings().get("backup") or {}).get("token")) or "").strip()
+
+
+def token() -> str:
+    """The token AI Việt Côn uses for GitHub, or "" when not connected."""
+    conn = _read_conn()
+    if conn.get("source") == "backup":
+        return backup_token()
+    if conn.get("source") == "app":
+        return _app_token(conn)
+    return str(conn.get("token") or "").strip() if conn.get("source") == "own" else ""
+
+
+def _app_token(conn: Dict[str, Any]) -> str:
+    """Token from "Sign in with GitHub". The AI Việt Côn app issues tokens that do not expire; if one does carry an expiry
+    (the app setting was changed), renew it a minute early, and read as signed out when GitHub refuses."""
+    tok = str(conn.get("token") or "").strip()
+    try:
+        exp = float(conn.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        exp = 0.0
+    if not exp or _now() < exp - 60:
+        return tok
+    import github_oauth
+    with _lock:
+        cur = _read_conn()
+        if cur.get("source") != "app":
+            return token()
+        if str(cur.get("token") or "") != tok:      # another thread renewed it meanwhile
+            return str(cur.get("token") or "").strip()
+        fresh = github_oauth.refresh(str(cur.get("refresh_token") or ""))
+        if not fresh:
+            return ""
+        _write_conn({**cur, "token": fresh["access_token"], "refresh_token": fresh["refresh_token"] or cur.get("refresh_token"),
+                     "expires_at": fresh["expires_at"]})
+        return fresh["access_token"]
+
+
+def user_id() -> int:
+    """GitHub numeric id of the connected account (for the noreply commit email), 0 when unknown."""
+    try:
+        return int(_read_conn().get("user_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _check_token(tok: str, app: bool = False) -> Dict[str, Any]:
+    """Validate a token against GitHub. Returns {login, scopes_ok, missing} or raises RepoError.
+
+    `app` marks a "Sign in with GitHub" token. GitHub App tokens have no OAuth scopes at all (access comes from the
+    app's permissions plus the repos picked at install), yet GitHub still sends an EMPTY X-OAuth-Scopes header for
+    them, which read as "missing repo, workflow" on every successful sign-in. Only classic tokens are scope-checked.
+    """
+    if not tok:
+        raise RepoError(_c("Chưa có token.", "No token given."))
+    try:
+        u = GitHub(tok).user()
+    except GitHubError as e:
+        if e.status == 401:
+            raise RepoError(_c("GitHub không nhận token này (sai hoặc đã hết hạn).",
+                               "GitHub rejected this token (wrong or expired)."))
+        raise RepoError(_c(f"Không kiểm tra được token: {e}", f"Could not check the token: {e}"))
+    scopes = u.get("_scopes")
+    missing: List[str] = []
+    # Classic tokens list their scopes. Fine-grained and GitHub App tokens either omit the header or send it empty,
+    # and are checked per repo instead, so their scopes count as unknown, never as missing.
+    if app or not _is_classic(tok):
+        scopes = None
+    if scopes is not None and "repo" not in scopes:
+        missing.append("repo")
+    if scopes is not None and "workflow" not in scopes:
+        missing.append("workflow")
+    return {"login": u.get("login") or "", "id": int(u.get("id") or 0), "missing": missing,
+            "classic": scopes is not None}
+
+
+# Prefixes of tokens that are NOT classic: GitHub App user (ghu_), installation (ghs_), refresh (ghr_) and
+# fine-grained personal access tokens. Anything else (ghp_, gho_, legacy 40-hex) is treated as classic.
+_NON_CLASSIC_PREFIXES = ("ghu_", "ghs_", "ghr_", "github_pat_")
+
+
+def _is_classic(tok: str) -> bool:
+    return not (tok or "").startswith(_NON_CLASSIC_PREFIXES)
+
+
+def _replace_conn(conn: Dict[str, Any], who: Optional[Dict[str, str]]) -> None:
+    """A connect or disconnect the person asked for: store it, and log it when the account changes."""
+    before = _read_conn()
+    _write_conn(conn)
+    _log_conn_change(before, conn, who)
+
+
+def connect(tok: str, who: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    tok = (tok or "").strip()
+    info = _check_token(tok)
+    _replace_conn({"source": "own", "token": tok, "login": info["login"], "user_id": info["id"],
+                   "missing": info["missing"], "connected_at": _now()}, who)
+    _REPO_CACHE.update(at=0.0, items=[])
+    return status()
+
+
+def connect_app(fields: Dict[str, Any], who: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Store the token "Sign in with GitHub" just received (github_oauth.poll). Checked like a pasted token."""
+    tok = str((fields or {}).get("access_token") or "").strip()
+    info = _check_token(tok, app=True)
+    _replace_conn({"source": "app", "token": tok, "refresh_token": str(fields.get("refresh_token") or ""),
+                   "expires_at": float(fields.get("expires_at") or 0), "login": info["login"], "user_id": info["id"],
+                   "missing": info["missing"], "connected_at": _now()}, who)
+    _REPO_CACHE.update(at=0.0, items=[])
+    _INSTALL_CACHE.update(at=0.0, n=-1)
+    return status()
+
+
+# How many accounts the AI Việt Côn app is installed on, as the signed-in person sees it. Zero means signed in but no repo
+# picked yet, the one step people miss. Cached briefly: the Connections page reads status on every visit.
+_INSTALL_CACHE: Dict[str, Any] = {"at": 0.0, "n": -1}
+INSTALL_CACHE_S = 30.0
+
+
+def _installs(tok: str) -> int:
+    now = _now()
+    if _INSTALL_CACHE["at"] and now - _INSTALL_CACHE["at"] < INSTALL_CACHE_S:
+        return int(_INSTALL_CACHE["n"])
+    try:
+        d = GitHub(tok).get("/user/installations", params={"per_page": 1})
+        n = int((d or {}).get("total_count") or 0) if isinstance(d, dict) else 0
+    except GitHubError:
+        # unknown: say nothing rather than nag. 0.444.4: remembered too, so a GitHub outage or a dead network does
+        # not cost a fresh request (and its timeout) on every Connections visit.
+        _INSTALL_CACHE.update(at=now, n=-1)
+        return -1
+    _INSTALL_CACHE.update(at=now, n=n)
+    return n
+
+
+def connect_backup(who: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    tok = backup_token()
+    if not tok:
+        raise RepoError(_c("Chưa có token sao lưu brain để dùng chung.", "There is no brain-backup token to reuse."))
+    info = _check_token(tok)
+    _replace_conn({"source": "backup", "login": info["login"], "user_id": info["id"], "missing": info["missing"],
+                   "connected_at": _now()}, who)
+    _REPO_CACHE.update(at=0.0, items=[])
+    return status()
+
+
+def disconnect(who: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    _replace_conn({}, who)
+    _REPO_CACHE.update(at=0.0, items=[])
+    _INSTALL_CACHE.update(at=0.0, n=-1)
+    return status()
+
+
+def status() -> Dict[str, Any]:
+    conn = _read_conn()
+    tok = token()
+    return {
+        "connected": bool(tok),
+        "login": conn.get("login") or "",
+        "source": conn.get("source") or "",
+        # A classic token missing scopes still works for reading; say which ones so the person can add them.
+        # Never for an app sign-in: it has no scopes, and a stale flag stored by 0.430.0 to 0.432.1 is dropped here.
+        "missing": [] if conn.get("source") == "app" else list(conn.get("missing") or []),
+        "backup_token": bool(backup_token()),
+        # git_setup also finds a git installed after this server started (PATH of a running process never updates).
+        "has_git": git_setup.available(),
+        # "Sign in with GitHub": where to pick repos, and how many accounts the app is on (-1 unknown).
+        "install_url": _oauth_install_url(),
+        "installs": _installs(tok) if (tok and conn.get("source") == "app") else -1,
+    }
+
+
+def _oauth_install_url() -> str:
+    import github_oauth
+    return github_oauth.install_url()
+
+
+def client() -> GitHub:
+    tok = token()
+    if not tok:
+        raise RepoError(_c("Chưa kết nối GitHub. Vào trang Kết nối để kết nối.",
+                           "GitHub is not connected. Connect it on the Connections page."))
+    return GitHub(tok)
+
+
+# ============================================================
+# Git helpers (token in the environment, never in argv)
+# ============================================================
+def git_env() -> Dict[str, str]:
+    """Environment of a git call that carries NO credential."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["LC_ALL"] = "C"
+    env.pop("GIT_ASKPASS", None)
+    return env
+
+
+# ---- isolation of the calls that carry the token (threat model in the module docstring) ----
+# An empty folder that `core.hooksPath` points at, so no hook of the repo runs while the token is in the environment.
+# A folder rather than the null device: it behaves the same on Linux, macOS and Windows.
+NO_HOOKS_DIR = STATE_DIR / "git-no-hooks"
+# Set on every authenticated call. Environment config is read last, so each line beats the repo's own value.
+ISOLATION = (
+    ("core.fsmonitor", "false"),      # a repo can name a program here; checkout and worktree add would start it
+    ("core.askPass", ""),             # the program git starts to ask for a password when GitHub answers 401
+    ("credential.helper", ""),        # an empty value drops every helper listed before it, same reason
+    ("gc.auto", "0"),                 # no background maintenance: it outlives the call holding the same environment,
+    ("maintenance.auto", "false"),    # and `gc.recentObjectsHook` is one more program of the repo's choosing
+    ("push.gpgSign", "false"),        # a signed push would start `gpg.program`
+    # A submodule the chat initialised is a second repo with a config of its own, which nothing here vets. git walks
+    # into it by default on fetch, and on checkout and push when told to. AI Việt Côn never manages submodules itself.
+    ("fetch.recurseSubmodules", "false"),
+    ("submodule.recurse", "false"),
+    ("push.recurseSubmodules", "no"),
+)
+# Programs that convert file contents, run by checkout. A value set at repo level is replaced by the machine's own
+# value (Git LFS is installed there) or by the neutral one, so a repo cannot swap the driver for the call.
+_DRIVER_NEUTRAL = {"smudge": "", "clean": "", "process": "", "required": "false"}
+# http.* settings a repo may keep: none of them moves the connection or what it trusts. Every other http.* key
+# (proxy, sslVerify, sslCAInfo, curloptResolve, cookieFile...) refuses the call, and so does one git adds later.
+_HTTP_HARMLESS = frozenset({"postbuffer", "lowspeedlimit", "lowspeedtime", "version", "maxrequests", "minsessions",
+                            "useragent"})
+_REMOTE_STEERING = frozenset({"pushurl", "proxy", "proxyauthmethod", "vcs", "uploadpack", "receivepack"})
+_CORE_PROGRAMS = frozenset({"sshcommand", "gitproxy", "alternaterefscommand"})
+_MACHINE_SCOPES = frozenset({"system", "global", "command"})
+
+
+def _split_key(key: str) -> tuple:
+    """`section.subsection.variable` as git prints it: (section, subsection, variable), subsection may hold dots."""
+    section, _, rest = str(key or "").partition(".")
+    sub, _, var = rest.rpartition(".")
+    return section.lower(), sub, var.lower()
+
+
+def _config_entries(cwd: str) -> List[tuple]:
+    """Every git config entry in effect in `cwd`, in git's own order: (scope, key, value). No token in this call."""
+    try:
+        p = subprocess.run(["git", "config", "--list", "--show-scope", "-z"], cwd=cwd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT, env=git_env(),
+                           creationflags=winproc.no_window())
+    except FileNotFoundError:
+        raise RepoError(_c("Máy này chưa cài git.", "git is not installed on this machine."))
+    except subprocess.TimeoutExpired:
+        p = None
+    if p is None or p.returncode != 0:
+        # Unreadable config: nothing proves the call is safe, so the token stays home.
+        why = ((p.stderr if p else "") or "").strip().splitlines()[-1:] or ["?"]
+        raise RepoError(_c(f"Không đọc được cấu hình git của repository nên AI Việt Côn không dùng token ở đây: {why[0]}",
+                           f"Could not read this repository's git config, so AI Việt Côn will not use the token here: {why[0]}"))
+    parts = (p.stdout or "").split("\0")
+    out = []
+    for i in range(0, len(parts) - 1, 2):
+        key, _, value = parts[i + 1].partition("\n")
+        out.append((parts[i], key, value))
+    return out
+
+
+def _protocol(url: str) -> str:
+    """The git transport a URL uses: its scheme, `ssh` for the scp form (git@host:path), `file` for a path."""
+    if "://" in url:
+        return url.split("://", 1)[0].lower()
+    return "ssh" if ":" in url.split("/", 1)[0] and not re.match(r"^[A-Za-z]:", url) else "file"
+
+
+def _vet_config(entries: List[tuple], origin: str) -> List[tuple]:
+    """Overrides that neutralise this repo's own config for one authenticated call. Raises RepoError, naming the
+    settings, when the repo-level config holds one that could move the token and that no override can beat."""
+    machine: Dict[str, str] = {}
+    repo = []
+    for scope, key, value in entries:
+        if scope in _MACHINE_SCOPES:
+            machine[key] = value
+        else:
+            repo.append((key, value))        # local, worktree, and any scope a later git invents
+    refused: List[str] = []
+    overrides: List[tuple] = []
+    for key, value in repo:
+        section, sub, var = _split_key(key)
+        steers = (
+            section in ("include", "includeif", "url")
+            or (section == "http" and var not in _HTTP_HARMLESS)
+            or (section == "remote" and sub == "origin" and var in _REMOTE_STEERING)
+            or (section == "core" and var in _CORE_PROGRAMS)
+            or (section == "lfs" and (var == "standalonetransferagent"
+                                      or sub.lower().startswith(("customtransfer.", "extension."))))
+        )
+        if steers:
+            refused.append(key)
+        elif (section == "filter" and var in _DRIVER_NEUTRAL) or key == "diff.external":
+            overrides.append((key, machine.get(key, _DRIVER_NEUTRAL.get(var, ""))))
+    # `origin` must still be the one remote GitHub's API named. A `git clone` is vetted without repo entries.
+    urls = [value for key, value in repo if key == "remote.origin.url"]
+    if repo and urls != [origin]:
+        refused.append("remote.origin.url")
+    if refused:
+        names = ", ".join(sorted(set(refused)))
+        raise RepoError(_c(f"AI Việt Côn không dùng token GitHub trong repository này: cấu hình git của bản clone ({names}) có thể "
+                           "đưa token đi nơi khác. Gỡ các dòng đó (git config --unset-all <tên>), hoặc gỡ repository khỏi "
+                           "brain rồi thêm lại.",
+                           f"AI Việt Côn will not use the GitHub token in this repository: the clone's git config ({names}) could "
+                           "send the token somewhere else. Remove those settings (git config --unset-all <name>), or "
+                           "remove the repository from the brain and add it again."))
+    return overrides
+
+
+def _allowed_protocols(entries: List[tuple], origin: str) -> str:
+    """The origin's own protocol, plus the one a machine-wide `insteadOf` moves it to (people who reach GitHub over
+    SSH set that in their global config). Nothing else: no `ext::`, no remote helper, no local path."""
+    allowed = [_protocol(origin)]
+    for scope, key, value in entries:
+        section, sub, var = _split_key(key)
+        if (scope in _MACHINE_SCOPES and section == "url" and var in ("insteadof", "pushinsteadof") and value
+                and origin.startswith(value) and _protocol(sub) in ("https", "http", "ssh", "git")):
+            allowed.append(_protocol(sub))
+    return ":".join(dict.fromkeys(allowed))
+
+
+def _no_hooks_dir() -> str:
+    """The empty folder hooks are looked up in during an authenticated call, emptied again if anything landed there."""
+    d = NO_HOOKS_DIR
+    if d.is_symlink() or (d.exists() and not d.is_dir()):
+        d.unlink()
+    d.mkdir(parents=True, exist_ok=True)
+    for child in list(d.iterdir()):
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink()
+    if any(d.iterdir()):
+        raise RepoError(_c(f"Không dọn trống được {d}, AI Việt Côn không dùng token khi thư mục đó còn file.",
+                           f"Could not empty {d}; AI Việt Côn will not use the token while files remain there."))
+    return d.as_posix()
+
+
+def _real(path: Any) -> str:
+    return os.path.normcase(os.path.realpath(str(path)))
+
+
+def trusted_origin(cwd: str) -> str:
+    """The origin URL GitHub's API gave for the clone `cwd` belongs to, from AI Việt Côn's registry; "" when `cwd` is not
+    inside one of AI Việt Côn's clones. Never read from the clone's own config: that is the part a model can rewrite."""
+    try:
+        p = git(["rev-parse", "--git-common-dir"], cwd, check=False)
+    except (RepoError, OSError):
+        return ""
+    common = (p.stdout or "").strip()
+    if p.returncode != 0 or not common:
+        return ""
+    root = _real((Path(cwd) / common).parent)       # the common dir of a clone and of all its worktrees is <clone>/.git
+    for r in _load()["repos"]:
+        if r.get("path") and _real(r["path"]) == root:
+            return str(r.get("clone_url") or "")
+    return ""
+
+
+def auth_env(cwd: str, origin: str, tok: Optional[str] = None, in_repo: bool = True) -> Dict[str, str]:
+    """Environment of a git call that carries the token, for `origin` only, isolated from the repo in `cwd`.
+
+    `origin` is the URL the token may go to and must come from GitHub's API (the registry), never from the clone.
+    Raises RepoError when the repo's config could still move the token (see `_vet_config`).
+    `in_repo=False` is for `git clone`: it makes a repo and reads the config of none, not even of a repo that
+    happens to enclose `cwd` (a default install keeps STATE_DIR inside the AI Việt Côn checkout), so only the machine's
+    config counts there."""
+    env = git_env()
+    tok = token() if tok is None else tok
+    if not tok:
+        return env
+    if not origin:
+        raise RepoError(_c(f"AI Việt Côn chỉ dùng token GitHub trong repository do chính nó clone, {cwd} không phải repository như vậy.",
+                           f"AI Việt Côn only uses the GitHub token inside a repository it cloned itself; {cwd} is not one."))
+    entries = [e for e in _config_entries(cwd) if in_repo or e[0] in _MACHINE_SCOPES]
+    pairs = [("core.hooksPath", _no_hooks_dir())] + list(ISOLATION) + _vet_config(entries, origin)
+    if origin.lower().startswith(("https://", "http://")):
+        basic = base64.b64encode(f"x-access-token:{tok}".encode()).decode()
+        pairs.append((f"http.{origin}.extraheader", f"AUTHORIZATION: basic {basic}"))
+    n = int(env.get("GIT_CONFIG_COUNT") or 0)
+    for i, (key, value) in enumerate(pairs, start=n):
+        env[f"GIT_CONFIG_KEY_{i}"] = key
+        env[f"GIT_CONFIG_VALUE_{i}"] = value
+    env["GIT_CONFIG_COUNT"] = str(n + len(pairs))
+    env["GIT_ALLOW_PROTOCOL"] = _allowed_protocols(entries, origin)     # beats every protocol.*.allow of the repo
+    env.pop("SSH_ASKPASS", None)
+    return env
+
+
+def _redact(text: str) -> str:
+    tok = token()
+    out = str(text or "")
+    if tok:
+        out = out.replace(tok, "***")
+        out = out.replace(base64.b64encode(f"x-access-token:{tok}".encode()).decode(), "***")
+    return out
+
+
+def git(args: List[str], cwd: str, *, timeout: int = GIT_TIMEOUT, auth: bool = False,
+        check: bool = True, origin: str = "") -> subprocess.CompletedProcess:
+    """Run git in `cwd`. `auth=True` puts the token in the call's environment, for the clone's registered origin
+    only and isolated from the repo's hooks and config (`auth_env`); it raises RepoError, even with `check=False`,
+    when that isolation cannot be had. `origin` names the URL when the registry cannot (a clone being made)."""
+    tok = token() if auth else ""
+    env = git_env()
+    if tok:
+        cloning = list(args[:1]) == ["clone"]       # no repo yet: the caller names the origin, the registry cannot
+        env = auth_env(cwd, origin or ("" if cloning else trusted_origin(cwd)), tok, in_repo=not cloning)
+    try:
+        p = subprocess.run(["git"] + list(args), cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, env=env, creationflags=winproc.no_window())
+    except FileNotFoundError:
+        raise RepoError(_c("Máy này chưa cài git.", "git is not installed on this machine."))
+    except subprocess.TimeoutExpired:
+        raise RepoError(_c(f"Lệnh git chạy quá {timeout} giây, đã dừng: git {args[0]}",
+                           f"git {args[0]} ran over {timeout} seconds and was stopped."))
+    if check and p.returncode != 0:
+        lines = _redact((p.stderr or p.stdout or "").strip()).splitlines()
+        last = lines[-1] if lines else _c("không rõ lý do", "unknown reason")
+        raise RepoError(_c(f"git {args[0]} hỏng: {last}", f"git {args[0]} failed: {last}"))
+    return p
+
+
+# Keyword arguments for every git call of AI Việt Côn that puts files of ANOTHER commit on disk (worktree add, checkout).
+# The clone is a partial one (`--filter=blob:none`): a fetch brings commits and trees, never file contents, so the
+# first checkout of a commit that arrived later makes git download the missing contents from origin by itself, in the
+# middle of the command. That hidden fetch needs the token like any other, and its size follows the repo, not
+# GIT_TIMEOUT. Without the token a private repo answered "could not fetch <sha> from promisor remote" and attaching the
+# repo to a chat failed as soon as the base branch had moved (owner, 12/11/2026). The checkout is where the repo's
+# post-checkout hook and filter drivers would run: `auth_env` keeps both out of a call that holds the token.
+CHECKOUT: Dict[str, Any] = {"auth": True, "timeout": 300}
+
+
+def git_out(args: List[str], cwd: str, **kw) -> str:
+    return (git(args, cwd, **kw).stdout or "").strip()
+
+
+def identity() -> Dict[str, str]:
+    """Who AI Việt Côn commits as: the connected GitHub account, with its noreply address."""
+    login = str(_read_conn().get("login") or "") or "javis"
+    uid = user_id()
+    email = f"{uid}+{login}@users.noreply.github.com" if uid else f"{login}@users.noreply.github.com"
+    return {"name": login, "email": email}
+
+
+def ensure_identity(cwd: str) -> None:
+    """Give the clone `cwd` belongs to a commit identity of its own, when it has none: the one AI Việt Côn commits with.
+
+    AI Việt Côn names itself through the environment of its own commits, so the clone never needed `user.name`. The chat's
+    engine runs git in the worktree too (`git merge` in a conflict fix round, `git stash`, a commit of its own), and
+    there git falls back on the machine: with no global identity, as in a container or on a fresh server, it stops
+    with "empty ident name" or "unable to auto-detect email address" before doing anything. A value the clone already
+    holds is kept. Best effort: a failure here must not stop the caller.
+    """
+    try:
+        for key, value in (("user.name", identity()["name"]), ("user.email", identity()["email"])):
+            if not git_out(["config", "--local", "--get", key], cwd, check=False):
+                git(["config", "--local", key, value], cwd, check=False)
+    except (RepoError, OSError):
+        pass
+
+
+def is_dirty(path: str) -> bool:
+    try:
+        return bool(git_out(["status", "--porcelain"], path))
+    except RepoError:
+        return True     # unreadable counts as dirty: refusing a delete is the safe mistake
+
+
+def unpushed_count(path: str) -> int:
+    """Commits on HEAD that no origin branch has. Unreadable counts as 1 (the safe answer)."""
+    try:
+        return int(git_out(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], path) or 0)
+    except (RepoError, ValueError):
+        return 1
+
+
+# ============================================================
+# Registry
+# ============================================================
+def _empty() -> dict:
+    return {"version": 1, "repos": [], "bases": {}}
+
+
+def _load() -> dict:
+    try:
+        d = json.loads(STORE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _empty()
+    except Exception:
+        try:
+            STORE_PATH.rename(STORE_PATH.with_suffix(".json.broken"))
+        except Exception:
+            pass
+        return _empty()
+    if not isinstance(d, dict) or not isinstance(d.get("repos"), list):
+        return _empty()
+    return d
+
+
+def _save(d: dict) -> None:
+    STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STORE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STORE_PATH)
+
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def norm_full_name(full_name: str) -> str:
+    s = str(full_name or "").strip().strip("/")
+    if s.endswith(".git"):
+        s = s[:-4]
+    if not _NAME_RE.match(s) or ".." in s:
+        raise RepoError(_c(f"Tên repository không hợp lệ: {full_name}", f"Invalid repository name: {full_name}"))
+    return s
+
+
+def _brain_slug(brain_root: str) -> str:
+    name = Path(str(brain_root or "brain")).name or "brain"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:60] or "brain"
+
+
+def clone_path(brain_root: str, full_name: str) -> Path:
+    owner, name = norm_full_name(full_name).split("/", 1)
+    return REPOS_DIR / _brain_slug(brain_root) / owner / name
+
+
+def _same_brain(stored: Any, brain: str) -> bool:
+    """A record belongs to `brain` whichever spelling either side uses (#1109). A chat turn passes the alias "brain"
+    for the default brain while the dashboard saved the record with its folder ("/brains/Brain Default"); comparing
+    the strings hid the record, so the gate ran CI's commands instead of the saved ones and the GitHub card listed
+    nothing. brain_ident never folds an unknown folder into the default brain."""
+    return stored == brain or brain_ident.same_brain(stored, brain)
+
+
+def list_local(brain: str = "") -> List[Dict[str, Any]]:
+    return [dict(r) for r in _load()["repos"] if not brain or _same_brain(r.get("brain"), brain)]
+
+
+def find(brain: str, full_name: str) -> Optional[Dict[str, Any]]:
+    fn = norm_full_name(full_name).lower()
+    same_name = [r for r in _load()["repos"] if str(r.get("full_name") or "").lower() == fn]
+    # The exact spelling first: an older install may hold one record per spelling of the same brain.
+    for r in same_name:
+        if r.get("brain") == brain:
+            return dict(r)
+    for r in same_name:
+        if _same_brain(r.get("brain"), brain):
+            return dict(r)
+    return None
+
+
+def _put(rec: Dict[str, Any]) -> None:
+    with _lock:
+        d = _load()
+        d["repos"] = [r for r in d["repos"] if r.get("id") != rec["id"]]
+        d["repos"].append(rec)
+        _save(d)
+
+
+def _drop(rid: str) -> None:
+    with _lock:
+        d = _load()
+        d["repos"] = [r for r in d["repos"] if r.get("id") != rid]
+        _save(d)
+
+
+# ---- base branch per conversation (0.368.0) ----
+# A chat works on its own branch cut from a base: the repo's default branch unless the person picked another one
+# ("Change branch" on the repo chip). The pick lives here, keyed by chat and repo, and the PR targets it.
+def session_base(sid: str, full_name: str) -> str:
+    bases = (_load().get("bases") or {}).get(str(sid or ""), {}) or {}
+    return str(bases.get(str(full_name or "").lower()) or "")
+
+
+def _set_session_base(sid: str, full_name: str, base: str) -> None:
+    with _lock:
+        d = _load()
+        bases = d.setdefault("bases", {})
+        per = bases.setdefault(str(sid), {})
+        if base:
+            per[str(full_name).lower()] = base
+        else:
+            per.pop(str(full_name).lower(), None)
+        if not per:
+            bases.pop(str(sid), None)
+        _save(d)
+
+
+def _forget_bases(sid: str) -> None:
+    with _lock:
+        d = _load()
+        if (d.get("bases") or {}).pop(str(sid), None) is not None:
+            _save(d)
+
+
+def norm_branch(name: str) -> str:
+    """A branch name safe to hand to git: no leading dash, no `..`, no `.lock`, nothing outside [A-Za-z0-9._/-]."""
+    s = str(name or "").strip()
+    if (not s or len(s) > 200 or s.startswith(("-", "/")) or s.endswith(("/", ".", ".lock")) or ".." in s
+            or "//" in s or not re.match(r"^[A-Za-z0-9._/-]+$", s)):
+        raise RepoError(_c(f"Tên nhánh không hợp lệ: {name}", f"Invalid branch name: {name}"))
+    return s
+
+
+def branches(full_name: str) -> Dict[str, Any]:
+    """Branches of a repo for the branch picker: the default branch first, then the rest by name."""
+    fn = norm_full_name(full_name)
+    tok = token()
+    if not tok:
+        raise RepoError(_c("Chưa kết nối GitHub.", "GitHub is not connected."))
+    gh = GitHub(tok)
+    try:
+        default = str((gh.repo(fn) or {}).get("default_branch") or "main")
+        # AI Việt Côn's own working branches (javis/...) are where chats push, never a base to start from.
+        names = sorted({b for b in gh.branches(fn) if not b.startswith("javis/")} - {default}, key=str.lower)
+    except GitHubError as e:
+        raise RepoError(_c(f"Không lấy được danh sách nhánh: {e}", f"Could not list branches: {e}"))
+    return {"default": default, "items": [default] + names}
+
+
+def _repo_lock(path: str) -> threading.Lock:
+    with _lock:
+        lk = _repo_locks.get(path)
+        if lk is None:
+            lk = _repo_locks[path] = threading.Lock()
+        return lk
+
+
+# ============================================================
+# Remote list
+# ============================================================
+def remote_repos(q: str = "", brain: str = "") -> List[Dict[str, Any]]:
+    tok = token()
+    if not tok:
+        raise RepoError(_c("Chưa kết nối GitHub.", "GitHub is not connected."))
+    now = _now()
+    if _REPO_CACHE["token"] != tok or now - _REPO_CACHE["at"] > REPO_CACHE_S:
+        try:
+            items = GitHub(tok).repos()
+        except GitHubError as e:
+            raise RepoError(_c(f"Không lấy được danh sách repository: {e}", f"Could not list repositories: {e}"))
+        _REPO_CACHE.update(at=now, token=tok, items=items)
+    local = {str(r.get("full_name") or "").lower() for r in list_local(brain)}
+    term = str(q or "").strip().lower()
+    out = []
+    for r in _REPO_CACHE["items"]:
+        fn = str(r.get("full_name") or "")
+        if term and term not in fn.lower():
+            continue
+        out.append({"full_name": fn, "private": bool(r.get("private")), "default_branch": r.get("default_branch") or "",
+                    "pushed_at": r.get("pushed_at") or "", "description": (r.get("description") or "")[:140],
+                    "can_push": bool((r.get("permissions") or {}).get("push", True)),
+                    "cloned": fn.lower() in local})
+    return out
+
+
+# ============================================================
+# Clone
+# ============================================================
+def ensure_clone(brain: str, brain_root: str, full_name: str) -> Dict[str, Any]:
+    """Clone the repo into this brain's repo folder, or fetch it when it is already there. Returns the record."""
+    full_name = norm_full_name(full_name)
+    gh = client()
+    try:
+        meta = gh.repo(full_name)
+    except GitHubError as e:
+        if e.status == 404:
+            raise RepoError(_c(f"Không thấy repository {full_name}, hoặc token chưa được cấp quyền vào repository này.",
+                               f"Repository {full_name} not found, or the token has no access to it."))
+        raise RepoError(_c(f"Không đọc được repository {full_name}: {e}", f"Could not read repository {full_name}: {e}"))
+    full_name = meta.get("full_name") or full_name
+    default_branch = meta.get("default_branch") or "main"
+    clone_url = meta.get("clone_url") or f"https://github.com/{full_name}.git"
+    can_push = bool((meta.get("permissions") or {}).get("push", True))
+    dest = clone_path(brain_root, full_name)
+    with _repo_lock(str(dest)):
+        rec = find(brain, full_name)
+        if dest.is_dir() and (dest / ".git").exists():
+            # `origin` follows GitHub's own answer: a URL that drifted, or that a chat's shell rewrote, is put back
+            # before the token goes anywhere (auth_env refuses a clone whose origin is not this URL).
+            git(["remote", "set-url", "origin", clone_url], str(dest), check=False)
+            git(["fetch", "--prune", "origin"], str(dest), auth=True, timeout=CLONE_TIMEOUT, origin=clone_url)
+        else:
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)   # a half-finished clone from a crash, never user work
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            git(["clone", "--filter=blob:none", "--no-tags", clone_url, str(dest)], str(dest.parent),
+                auth=True, timeout=CLONE_TIMEOUT, origin=clone_url)
+        if not rec:
+            rec = {"id": uuid.uuid4().hex[:12], "brain": brain, "added_at": _now()}
+        # Merge methods the repo allows, in AI Việt Côn's order of preference (spec 11.1: follow the repo's settings).
+        allowed = [m for m, k in (("squash", "allow_squash_merge"), ("merge", "allow_merge_commit"),
+                                  ("rebase", "allow_rebase_merge")) if meta.get(k, True)]
+        rec.update({"full_name": full_name, "path": str(dest), "default_branch": default_branch,
+                    "clone_url": clone_url, "private": bool(meta.get("private")), "can_push": can_push,
+                    "merge_methods": allowed or ["squash", "merge", "rebase"], "fetched_at": _now()})
+        folder = coding_store.them_thu_muc(str(dest), brain=brain, ten=full_name.split("/", 1)[1],
+                                           nguon=SOURCE, repo=full_name)
+        rec["folder_id"] = folder["id"]
+        _put(rec)
+    return dict(rec)
+
+
+# ============================================================
+# Attach to a conversation
+# ============================================================
+def _sid8(sid: str) -> str:
+    return coding_store._sid_ngan(sid)
+
+
+def session_branch(sid: str) -> str:
+    return f"javis/{_sid8(sid)}"
+
+
+def _worktree_dir(rec: Dict[str, Any], sid: str) -> Path:
+    return coding_store.WORKTREE_DIR / f"gh-{rec['id']}-{_sid8(sid)}"
+
+
+def ensure_worktree(sid: str, rec: Dict[str, Any]) -> Dict[str, str]:
+    """This conversation's worktree of the repo, created on `javis/<session>` from origin's default branch."""
+    ensure_identity(rec["path"])       # the engine runs git in the worktree: merge and stash need a committer
+    existing = coding_store.worktree_thu_muc(sid, rec["folder_id"])
+    if existing and Path(existing).is_dir():
+        return {"worktree": existing, "branch": coding_store.nhanh_hien_tai(existing)}
+    dest = _worktree_dir(rec, sid)
+    branch = session_branch(sid)
+    clone = rec["path"]
+    with _repo_lock(clone):
+        coding_store.WORKTREE_DIR.mkdir(parents=True, exist_ok=True)
+        git(["worktree", "prune"], clone, check=False)
+        have = git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], clone, check=False).returncode == 0
+        if dest.exists() and not (dest / ".git").exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        if not dest.exists():
+            base_name = session_base(sid, rec.get("full_name") or "") or rec.get("default_branch") or "main"
+            if not have and base_name != (rec.get("default_branch") or "main"):
+                git(["fetch", "origin", f"+refs/heads/{base_name}:refs/remotes/origin/{base_name}"], clone, auth=True,
+                    timeout=300)
+            base = f"origin/{base_name}"
+            args = ["worktree", "add", str(dest), branch] if have else ["worktree", "add", "-b", branch, str(dest), base]
+            git(args, clone, **CHECKOUT)
+            # The branch tracks nothing yet; the first push sets its upstream.
+            git(["config", f"branch.{branch}.javisBase", base_name], clone, check=False)
+    coding_store.dat_worktree_thu_muc(sid, rec["folder_id"], str(dest))
+    return {"worktree": str(dest), "branch": branch}
+
+
+def attach(sid: str, brain: str, brain_root: str, full_names: List[str]) -> Dict[str, Any]:
+    """Set the GitHub repos of a conversation (clone what is missing, one worktree each).
+
+    Non-GitHub folders the conversation already has stay where they are (a pinned folder stays the main one). Repos no
+    longer in the list are detached, which refuses while their worktree holds unsaved work.
+    """
+    sid = str(sid or "").strip()
+    if not sid:
+        raise RepoError(_c("Thiếu mã cuộc trò chuyện.", "Missing conversation id."))
+    wanted: List[str] = []
+    for fn in full_names or []:
+        n = norm_full_name(fn)
+        if n.lower() not in {w.lower() for w in wanted}:
+            wanted.append(n)
+    recs = [ensure_clone(brain, brain_root, fn) for fn in wanted]
+    current = coding_store.thu_muc_cua_phien(sid)
+    keep_other = [r["id"] for r in current if r.get("nguon") != SOURCE]
+    wanted_ids = [r["folder_id"] for r in recs]
+    for r in current:
+        if r.get("nguon") == SOURCE and r["id"] not in wanted_ids:
+            detach(sid, r.get("repo") or "", brain)
+    coding_store.dat_rang_buoc(sid, thu_muc_ids=keep_other + wanted_ids)
+    for rec in recs:
+        ensure_worktree(sid, rec)
+    return session_view(sid, brain)
+
+
+def _attach_one(sid: str, brain: str, brain_root: str, full_name: str) -> Dict[str, Any]:
+    """Bind ONE more repo to the chat, after what it already has, with its worktree. Nothing else is touched.
+
+    A folder bound without its worktree would put the engine in the shared clone, so a failure takes the binding off
+    again before it is raised."""
+    rec = ensure_clone(brain, brain_root, full_name)
+    ids = [r["id"] for r in coding_store.thu_muc_cua_phien(sid)]
+    fresh = rec["folder_id"] not in ids
+    try:
+        if fresh:
+            coding_store.dat_rang_buoc(sid, thu_muc_ids=ids + [rec["folder_id"]])
+        ensure_worktree(sid, rec)
+    except Exception:
+        if fresh:
+            try:
+                coding_store.dat_rang_buoc(sid, thu_muc_ids=ids)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    return rec
+
+
+def add(sid: str, brain: str, brain_root: str, full_name: str) -> Dict[str, Any]:
+    """Attach one repo to a conversation and leave its other repos alone (the "+" of the picker, 2026-11-21).
+
+    The picker used to send the whole list (`attach`) for every tick. One repo that could not come off (unsaved work)
+    then refused the request as a whole, so the repo just ticked was dropped with it and the chat "jumped back" to the
+    old one. Adding and removing are separate requests now: this one, and `detach`."""
+    sid = str(sid or "").strip()
+    if not sid:
+        raise RepoError(_c("Thiếu mã cuộc trò chuyện.", "Missing conversation id."))
+    n = norm_full_name(full_name)
+    on_chat = {str(r.get("repo") or "").lower() for r in coding_store.thu_muc_cua_phien(sid) if r.get("nguon") == SOURCE}
+    if n.lower() not in on_chat:
+        _attach_one(sid, brain, brain_root, n)
+    return session_view(sid, brain)
+
+
+# ============================================================
+# Repos a chat inherits from its project or its assistant (2026-11-15)
+# ============================================================
+# Owner, 15/11/2026: "ở chức năng project cũng có khả năng thêm repo để dễ dàng tạo các dự án code, hoặc cả trong tài
+# liệu của agent và team". A project (sessions.project_repos) or an assistant (`assets.repos` in its file) lists repos;
+# every chat of it gets them on its next turn, each on the chat's own branch like a repo picked in the composer.
+# Each repo is offered ONCE per chat (`seeded` in the registry): a repo the person detached from one chat stays
+# detached, while a repo added to the project later still reaches its older chats.
+def prepare(brain: str, brain_root: str, full_names: List[str]) -> List[str]:
+    """Check and clone the repos a project or an assistant is about to list, so a chat that inherits one later only
+    adds a worktree. Returns the names as GitHub spells them; raises RepoError (localized) on the first failure."""
+    out: List[str] = []
+    for fn in full_names or []:
+        n = norm_full_name(fn)
+        if n.lower() in {o.lower() for o in out}:
+            continue
+        out.append(ensure_clone(brain, brain_root, n)["full_name"])
+    return out
+
+
+def seeded(sid: str) -> List[str]:
+    """Lower-cased names of the inherited repos this chat was already given (or already had)."""
+    got = (_load().get("seeded") or {}).get(str(sid or ""), [])
+    return [str(x) for x in got] if isinstance(got, list) else []
+
+
+def _mark_seeded(sid: str, names: List[str]) -> None:
+    if not names:
+        return
+    with _lock:
+        d = _load()
+        per = d.setdefault("seeded", {}).setdefault(str(sid), [])
+        for n in names:
+            if n.lower() not in per:
+                per.append(n.lower())
+        _save(d)
+
+
+def _forget_seeds(sid: str) -> None:
+    with _lock:
+        d = _load()
+        if (d.get("seeded") or {}).pop(str(sid), None) is not None:
+            _save(d)
+
+
+def seed_session(sid: str, brain: str, brain_root: str, full_names: List[str]) -> Dict[str, Any]:
+    """Attach to a chat the inherited repos it has not been given yet. Never detaches anything, never moves the chat's
+    main folder: a new repo goes after what the chat already has (a chat with nothing gets it as its main folder).
+
+    A repo that fails (GitHub disconnected, no access) is not marked, so the next turn tries again.
+    Returns {"attached": [names], "failed": [{"full_name", "error"}]}.
+    """
+    sid = str(sid or "").strip()
+    out: Dict[str, Any] = {"attached": [], "failed": []}
+    if not sid or not full_names:
+        return out
+    done = set(seeded(sid))
+    todo: List[str] = []
+    for fn in full_names:
+        try:
+            n = norm_full_name(fn)
+        except RepoError:
+            continue
+        if n.lower() not in done and n.lower() not in {t.lower() for t in todo}:
+            todo.append(n)
+    if not todo:
+        return out
+    on_chat = {str(r.get("repo") or "").lower() for r in coding_store.thu_muc_cua_phien(sid) if r.get("nguon") == SOURCE}
+    marked: List[str] = []
+    for n in todo:
+        if n.lower() in on_chat:
+            marked.append(n)          # already picked in the composer: nothing to add, only remember it was offered
+            continue
+        try:
+            rec = _attach_one(sid, brain, brain_root, n)
+        except Exception as e:  # noqa: BLE001 - one repo failing must not stop the turn or the other repos
+            out["failed"].append({"full_name": n, "error": str(e) or type(e).__name__})
+            continue
+        out["attached"].append(rec.get("full_name") or n)
+        marked.append(n)
+    _mark_seeded(sid, marked)
+    return out
+
+
+def _rec_for_folder(brain: str, folder: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    fn = folder.get("repo") or ""
+    if not fn:
+        return None
+    try:
+        return find(brain, fn) or next((r for r in list_local() if r.get("folder_id") == folder.get("id")), None)
+    except RepoError:
+        return None
+
+
+def _risk_of(path: str) -> tuple:
+    """What deleting `path` would lose: ("dirty", 0) for edits not committed, ("unpushed", n) for commits GitHub does
+    not have, ("", 0) when it is safe."""
+    if not Path(path).is_dir():
+        return "", 0
+    if is_dirty(path):
+        return "dirty", 0
+    n = unpushed_count(path)
+    return ("unpushed", n) if n else ("", 0)
+
+
+def _risk_text(kind: str, n: int) -> str:
+    if kind == "dirty":
+        return _c("còn sửa đổi chưa commit", "has uncommitted changes")
+    if kind == "unpushed":
+        return _c(f"còn {n} commit chưa đẩy lên GitHub", f"has {n} commit(s) not pushed to GitHub")
+    return ""
+
+
+def _work_at_risk(path: str) -> str:
+    """Why deleting `path` would lose work, or "" when it is safe."""
+    return _risk_text(*_risk_of(path))
+
+
+def _remove_worktree(clone: str, wt: str) -> None:
+    if Path(clone).is_dir():
+        git(["worktree", "remove", "--force", wt], clone, check=False)
+        git(["worktree", "prune"], clone, check=False)
+    if Path(wt).exists():
+        shutil.rmtree(wt, ignore_errors=True)
+
+
+def detach(sid: str, full_name: str, brain: str = "", force: bool = False) -> Dict[str, Any]:
+    """Remove a repo from ONE conversation. The clone stays in the brain; this chat's worktree goes when it is safe."""
+    full_name = norm_full_name(full_name)
+    folders = [r for r in coding_store.thu_muc_cua_phien(sid)
+               if r.get("nguon") == SOURCE and str(r.get("repo") or "").lower() == full_name.lower()]
+    if not folders:
+        return {"ok": True, "detached": False}
+    folder = folders[0]
+    wt = coding_store.worktree_thu_muc(sid, folder["id"])
+    if wt and not force:
+        kind, n = _risk_of(wt)
+        if kind:
+            risk = _risk_text(kind, n)
+            # The code lets the picker ask "detach anyway?" on that row (force) instead of leaving a dead end.
+            raise RepoError(_c(f"Chưa bỏ được {full_name} khỏi cuộc trò chuyện: nhánh của cuộc này {risk} (tại {wt}).",
+                               f"Cannot detach {full_name}: this chat's branch {risk} (at {wt})."),
+                            code="work_at_risk", data={"full_name": full_name, "risk": kind, "count": n})
+    if wt:
+        _remove_worktree(folder["duong_dan"], wt)
+    coding_store.dat_worktree_thu_muc(sid, folder["id"], "")
+    ids = [r["id"] for r in coding_store.thu_muc_cua_phien(sid) if r["id"] != folder["id"]]
+    coding_store.dat_rang_buoc(sid, thu_muc_ids=ids)
+    return {"ok": True, "detached": True}
+
+
+def remove_from_brain(brain: str, full_name: str, busy: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Delete the local clone and every worktree of it. GitHub is never called (section 5.3).
+
+    Refuses, naming each place, while a job runs on it (`busy`), or while the clone or any worktree holds
+    uncommitted changes or commits GitHub does not have.
+    """
+    rec = find(brain, full_name)
+    if not rec:
+        raise RepoError(_c(f"Brain này không có repository {full_name}.", f"This brain has no repository {full_name}."))
+    problems: List[str] = []
+    for b in busy or []:
+        problems.append(_c(f"đang có việc chạy: {b}", f"a job is running: {b}"))
+    risk = _work_at_risk(rec["path"])
+    if risk:
+        problems.append(f"{rec['path']}: {risk}")
+    users = coding_store.sessions_using(rec.get("folder_id") or "")
+    for sid in users:
+        wt = coding_store.worktree_thu_muc(sid, rec["folder_id"])
+        r = _work_at_risk(wt) if wt else ""
+        if r:
+            problems.append(f"{wt}: {r}")
+    if problems:
+        raise RepoError(_c("Chưa gỡ được, để khỏi mất việc: ", "Not removed, to avoid losing work: ") + "; ".join(problems))
+    for sid in users:
+        wt = coding_store.worktree_thu_muc(sid, rec["folder_id"])
+        if wt:
+            _remove_worktree(rec["path"], wt)
+            coding_store.dat_worktree_thu_muc(sid, rec["folder_id"], "")
+        ids = [r["id"] for r in coding_store.thu_muc_cua_phien(sid) if r["id"] != rec["folder_id"]]
+        coding_store.dat_rang_buoc(sid, thu_muc_ids=ids)
+    path = Path(rec["path"]).resolve()
+    root = REPOS_DIR.resolve()
+    # Only ever delete inside STATE_DIR/repos: a registry edited by hand must not be able to point rmtree elsewhere.
+    if root in path.parents and path.exists():
+        shutil.rmtree(path, ignore_errors=False, onerror=_force_remove)
+    if rec.get("folder_id"):
+        coding_store.bo_thu_muc(rec["folder_id"])
+    _drop(rec["id"])
+    return {"ok": True, "removed": rec["full_name"], "github_untouched": True}
+
+
+def _force_remove(func, path, _exc):
+    """Windows keeps git object files read-only; clear the bit and retry once."""
+    try:
+        os.chmod(path, 0o700)
+        func(path)
+    except Exception:
+        pass
+
+
+# ============================================================
+# Views
+# ============================================================
+def session_repos(sid: str, brain: str = "") -> List[Dict[str, Any]]:
+    """GitHub repos attached to a conversation, with this chat's worktree and branch."""
+    out = []
+    for folder in coding_store.thu_muc_cua_phien(sid):
+        if folder.get("nguon") != SOURCE:
+            continue
+        rec = _rec_for_folder(brain, folder) or {}
+        wt = coding_store.worktree_thu_muc(sid, folder["id"])
+        out.append({"full_name": folder.get("repo") or rec.get("full_name") or "", "folder_id": folder["id"],
+                    "clone": folder["duong_dan"], "worktree": wt,
+                    "branch": coding_store.nhanh_hien_tai(wt) if wt and Path(wt).is_dir() else "",
+                    "default_branch": rec.get("default_branch") or "", "repo_id": rec.get("id") or "",
+                    "base_branch": session_base(sid, folder.get("repo") or rec.get("full_name") or "")
+                    or rec.get("default_branch") or "main",
+                    "can_push": rec.get("can_push", True)})
+    return out
+
+
+def set_base(sid: str, brain: str, full_name: str, base: str) -> Dict[str, Any]:
+    """Move this chat's work in one repo onto another base branch (spec 6, "Change branch" on the repo chip).
+
+    Only while the chat has nothing on its branch yet: no unsaved edit and no commit the current base lacks (an open
+    PR always has one). Then the chat's branch restarts from the new base and the next PR targets it.
+    """
+    fn = norm_full_name(full_name)
+    base = norm_branch(base)
+    repo = next((r for r in session_repos(sid, brain) if r["full_name"].lower() == fn.lower()), None)
+    if not repo:
+        raise RepoError(_c(f"{fn} chưa gắn vào cuộc trò chuyện này.", f"{fn} is not attached to this chat."))
+    if base == repo["base_branch"]:
+        return session_view(sid, brain)
+    if base not in branches(fn)["items"]:
+        raise RepoError(_c(f"Không thấy nhánh {base} trên GitHub.", f"Branch {base} does not exist on GitHub."))
+    wt = repo.get("worktree") or ""
+    if wt and Path(wt).is_dir():
+        if is_dirty(wt):
+            raise RepoError(_c(f"{fn}: còn sửa đổi chưa lưu trong cuộc này, xong việc đó rồi đổi nhánh.",
+                               f"{fn}: this chat still has unsaved edits; finish that work before changing branch."))
+        try:
+            ahead = int(git_out(["rev-list", "--count", f"origin/{repo['base_branch']}..HEAD"], wt) or 0)
+        except (RepoError, ValueError):
+            ahead = 1
+        if ahead:
+            raise RepoError(_c(f"{fn}: nhánh của cuộc này đang có việc chưa merge vào {repo['base_branch']}. "
+                               "Xong việc đó (hoặc mở cuộc trò chuyện mới) rồi đổi nhánh.",
+                               f"{fn}: this chat's branch has work not merged into {repo['base_branch']} yet. Finish it "
+                               "(or start a new chat) before changing branch."))
+        git(["fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}"], wt, auth=True, timeout=300)
+        cur = coding_store.nhanh_hien_tai(wt) or session_branch(sid)
+        git(["checkout", "-q", "-B", cur, f"origin/{base}"], wt, **CHECKOUT)
+        git(["config", f"branch.{cur}.javisBase", base], wt, check=False)
+    _set_session_base(sid, fn, "" if base == (repo.get("default_branch") or "main") else base)
+    return session_view(sid, brain)
+
+
+def session_view(sid: str, brain: str = "") -> Dict[str, Any]:
+    return {"ok": True, "repos": session_repos(sid, brain)}
+
+
+def local_view(brain: str) -> List[Dict[str, Any]]:
+    out = []
+    for r in list_local(brain):
+        users = coding_store.sessions_using(r.get("folder_id") or "")
+        out.append({"full_name": r["full_name"], "path": r["path"], "exists": Path(r["path"]).is_dir(),
+                    "default_branch": r.get("default_branch") or "", "chats": len(users),
+                    "auto_merge": auto_merge_on(r), "review": review_settings(r), "fetched_at": r.get("fetched_at") or 0})
+    return out
+
+
+def prompt_block(sid: str, brain: str = "") -> str:
+    """Prompt lines naming the conversation's GitHub repos and where to edit them. "" when none is attached.
+
+    Prompt text stays Vietnamese like the other coding blocks (docs/quy-uoc-dev.md: prompts are not translated).
+    """
+    try:
+        repos = [r for r in session_repos(sid, brain) if r.get("worktree")]
+    except Exception:
+        return ""
+    if not repos:
+        return ""
+    lines = ["", "# === REPO GITHUB CỦA CUỘC TRÒ CHUYỆN NÀY ==="]
+    for r in repos:
+        lines.append(f"- {r['full_name']}: sửa trong {r['worktree']} (nhánh {r['branch'] or session_branch(sid)}, "
+                     f"tách từ {r.get('base_branch') or r['default_branch'] or 'main'})")
+    lines.append("Chỉ sửa trong các thư mục trên, KHÔNG sửa bản clone gốc. KHÔNG tự `git push`, không tự merge, "
+                 "không đổi remote: việc đẩy lên GitHub do AI Việt Côn làm.")
+    lines.append("Trước khi kết thúc lượt có sửa code: tự chạy test và lint của repo. Sửa lỗi thì viết hoặc chạy một "
+                 "test TÁI HIỆN lỗi trước (đỏ), sửa, rồi chạy lại đúng test đó cho xanh. KHÔNG bỏ qua, xoá hay nới "
+                 "test, không sửa workflow CI để cho xanh. Sau mỗi lượt AI Việt Côn tự chạy bộ kiểm tra của repo; xanh thì AI Việt Côn "
+                 "tự commit, đẩy lên nhánh của cuộc này, mở PR và theo dõi CI. CI đỏ thì AI Việt Côn mở một lượt sửa "
+                 "kèm log, tối đa 3 vòng. CI xanh thì AI Việt Côn tự merge nếu repo bật tự merge (mặc định bật).")
+    lines += _work_state_lines(sid, repos)
+    # Spec 7.1: the repo's own rules reach every engine, not only the ones that read CLAUDE.md natively.
+    # Spec 13.1: plus the lessons AI Việt Côn wrote down for this repo after real failures (kept in the brain).
+    try:
+        import github_gate
+        import github_work
+        for r in repos:
+            lessons = github_work.read_lessons(brain, r["full_name"])
+            if lessons:
+                lines.append(f"Bài học đã ghi cho repo {r['full_name']} (từ lỗi thật trước đây):")
+                lines += [f"- {x}" for x in lessons]
+            rules = github_gate.repo_rules(r["worktree"])
+            if rules["files"]:
+                lines.append(f"Luật của repo {r['full_name']} (đọc đủ ở: {', '.join(rules['files'])}):")
+                lines.append(rules["text"])
+    except Exception:
+        pass
+    return "\n".join(lines) + "\n"
+
+
+def _work_state_lines(sid: str, repos: List[Dict[str, Any]]) -> List[str]:
+    """What GitHub really holds for this chat right now, read from github_work's store, never from earlier answers.
+
+    Without it the model guessed: asked to "push it" after a failed push it said it was not allowed to and offered to
+    edit code just to trigger a push (owner, 06/11/2026)."""
+    try:
+        import github_work
+        out = []
+        for r in repos:
+            row = github_work.st().get(sid, r["full_name"]) or {}
+            if not row:
+                continue
+            fn = r["full_name"]
+            if github_work.ship_failed(row):
+                out.append(f"Trạng thái {fn}: code đã commit trên máy nhưng CHƯA lên GitHub. Lý do: "
+                           f"{row.get('stuck_reason') or '?'} Không cần sửa code hay làm lại gì để đẩy: AI Việt Côn tự đẩy lại "
+                           "ngay sau lượt này, định kỳ vài phút một lần, và ngay khi GitHub được kết nối lại; nút Đẩy lại "
+                           "ở bảng GitHub của cuộc này cũng được.")
+            elif row.get("pr_number"):
+                out.append(f"Trạng thái {fn}: nhánh {row.get('branch')}, PR #{row['pr_number']} {row.get('pr_url') or ''}, "
+                           f"CI {row.get('ci')}, PR {row.get('integ')}"
+                           + (f", đang kẹt: {row['stuck_reason']}" if row.get("exec") == "stuck" and row.get("stuck_reason")
+                              else "") + ".")
+        if out:
+            out.append("Người dùng bảo đẩy lên hay merge thì nói đúng trạng thái trên và việc AI Việt Côn sẽ làm tiếp; KHÔNG nói "
+                       "là mình không được làm, KHÔNG bảo họ tự chạy git, KHÔNG đề nghị sửa code chỉ để kích hoạt việc đẩy.")
+        return out
+    except Exception:
+        return []
+
+
+def forget_session(sid: str) -> Dict[str, Any]:
+    """A deleted conversation: remove its worktrees that hold nothing unsaved; keep (and report) the others.
+
+    A worktree with work left is kept on disk on purpose: deleting a chat must never delete code. The branch stays in
+    the clone either way, so the work is still reachable from the repo.
+    """
+    kept: List[str] = []
+    for folder in coding_store.thu_muc_cua_phien(sid):
+        if folder.get("nguon") != SOURCE:
+            continue
+        wt = coding_store.worktree_thu_muc(sid, folder["id"])
+        if not wt:
+            continue
+        if _work_at_risk(wt):
+            kept.append(wt)
+            continue
+        _remove_worktree(folder["duong_dan"], wt)
+        coding_store.dat_worktree_thu_muc(sid, folder["id"], "")
+    _forget_seeds(sid)
+    if not kept:
+        coding_store.xoa_rang_buoc(sid)
+        _forget_bases(sid)
+    return {"kept": kept}
+
+
+def set_checks(brain: str, full_name: str, checks: Optional[List[Dict[str, str]]]) -> Dict[str, Any]:
+    """Save the repo's local check commands (None = go back to the suggested ones)."""
+    rec = find(brain, full_name)
+    if not rec:
+        raise RepoError(_c(f"Brain này không có repository {full_name}.", f"This brain has no repository {full_name}."))
+    if checks is None:
+        rec.pop("checks", None)
+    else:
+        clean = []
+        for c in checks:
+            run = str((c or {}).get("run") or "").strip()
+            if run:
+                clean.append({"name": str((c or {}).get("name") or run.splitlines()[0])[:80], "run": run[:2000]})
+        rec["checks"] = clean[:30]
+    _put(rec)
+    return get_checks(brain, full_name)
+
+
+def get_checks(brain: str, full_name: str) -> Dict[str, Any]:
+    rec = find(brain, full_name)
+    if not rec:
+        raise RepoError(_c(f"Brain này không có repository {full_name}.", f"This brain has no repository {full_name}."))
+    import github_gate
+    suggested = github_gate.suggest_checks(rec["path"]) if Path(rec["path"]).is_dir() else []
+    saved = rec.get("checks")
+    return {"full_name": rec["full_name"], "custom": isinstance(saved, list),
+            "checks": saved if isinstance(saved, list) else suggested, "suggested": suggested}
+
+
+def auto_merge_on(rec: Dict[str, Any]) -> bool:
+    """Spec 11.1 (owner 2026-10-27): green CI merges on its own; a per-repo switch turns it off. Default on."""
+    return rec.get("auto_merge", True) is not False
+
+
+def set_auto_merge(brain: str, full_name: str, on: bool) -> Dict[str, Any]:
+    rec = find(brain, full_name)
+    if not rec:
+        raise RepoError(_c(f"Brain này không có repository {full_name}.", f"This brain has no repository {full_name}."))
+    rec["auto_merge"] = bool(on)
+    _put(rec)
+    return {"full_name": rec["full_name"], "auto_merge": bool(on)}
+
+
+def review_settings(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Cross review of one repo (owner, 08/11/2026: "the person decides, not AI Việt Côn"). Off by default; when on, AI Việt Côn
+    reviews each green commit before merging, on `provider` when one is pinned, else on the background model."""
+    r = rec.get("review") if isinstance(rec.get("review"), dict) else {}
+    return {"on": r.get("on") is True, "provider": str(r.get("provider") or "")}
+
+
+def set_review(brain: str, full_name: str, on: bool, provider: str = "") -> Dict[str, Any]:
+    rec = find(brain, full_name)
+    if not rec:
+        raise RepoError(_c(f"Brain này không có repository {full_name}.", f"This brain has no repository {full_name}."))
+    rec["review"] = {"on": bool(on), "provider": str(provider or "").strip()[:64]}
+    _put(rec)
+    return {"full_name": rec["full_name"], "review": review_settings(rec)}
