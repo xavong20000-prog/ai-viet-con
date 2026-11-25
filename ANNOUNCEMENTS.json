@@ -3,7 +3,7 @@
   "announcements": [
     {
       "id": "chao-mung-ai-viet-con",
-      "kind": "news",
+      "kind": "community",
       "title": "Chào mừng đến với AI Việt Côn",
       "summary": "Bản tùy biến của JAVIS OS với giao diện tiếng Việt, màu vàng - xanh lá mạ.",
       "body": "Cập nhật mới sẽ được đăng tại github.com/xavong20000-prog/ai-viet-con.",
