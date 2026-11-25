@@ -88,8 +88,8 @@
 
 /* Linh vật: ngôi sao cam của logo AI Việt Côn (logo.svg), màu cố định như logo ở cả hai tông */
 .sn-sao { width: 100%; height: 100%; overflow: visible; }
-.sn-hinh { fill: #7cc242; }
-.sn-vien { fill: none; stroke: #FBBA9C; stroke-width: 6.5; stroke-linejoin: round; }
+.sn-hinh { fill: #F5D014; }
+.sn-vien { fill: none; stroke: #F6E27E; stroke-width: 6.5; stroke-linejoin: round; }
 .sn-cuoi { fill: none; stroke: #1F1F1F; stroke-width: 10; stroke-linecap: round; }
 .sn-mat ellipse { fill: #1F1F1F; }
 .sn-mat { transform-origin: 160px 152px; animation: snChop 4.5s infinite; }

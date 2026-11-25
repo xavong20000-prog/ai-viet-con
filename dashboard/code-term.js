@@ -118,14 +118,14 @@
   function bangMau() {
     var sang = !!(window.javisTheme && window.javisTheme.isLight());
     return sang
-      ? { background: "#ffffff", foreground: "#1c1a24", cursor: "#c2410c", cursorAccent: "#ffffff",
-          selectionBackground: "rgba(232,93,31,0.22)",
+      ? { background: "#ffffff", foreground: "#1c1a24", cursor: "#3b7d1f", cursorAccent: "#ffffff",
+          selectionBackground: "rgba(124, 194, 66, 0.22)",
           black: "#3b3b46", red: "#c62828", green: "#15803d", yellow: "#96590a", blue: "#1d4ed8",
-          magenta: "#7c3aed", cyan: "#0e7490", white: "#55505f",
+          magenta: "#d9a400", cyan: "#0e7490", white: "#55505f",
           brightBlack: "#6e6878", brightRed: "#d11f1f", brightGreen: "#16a34a", brightYellow: "#b45309",
           brightBlue: "#2563eb", brightMagenta: "#9333ea", brightCyan: "#0891b2", brightWhite: "#1c1a24" }
-      : { background: "#0b0b12", foreground: "#e8e8f4", cursor: "#ff7a3c", cursorAccent: "#0b0b12",
-          selectionBackground: "rgba(255,122,60,0.28)",
+      : { background: "#0b0b12", foreground: "#e8e8f4", cursor: "#7cc242", cursorAccent: "#0b0b12",
+          selectionBackground: "rgba(124, 194, 66, 0.28)",
           black: "#2a2a38", red: "#f4565a", green: "#34d36b", yellow: "#f0c020", blue: "#5b9cff",
           magenta: "#b98cff", cyan: "#4dd6d6", white: "#c0c0da",
           brightBlack: "#5a5a72", brightRed: "#ff7b7e", brightGreen: "#6ce89a", brightYellow: "#ffd85c",

@@ -1498,13 +1498,13 @@
   };
   // AI Việt Côn's own star, small and still (owner, 2026-11-04: "Javis" in the add form shows the star, not an avatar).
   function jmini() {
-    return '<svg class="nv-jmini" viewBox="56 50 208 200" aria-hidden="true"><path d="' + PET_STAR + '" fill="#fd6100"/><g fill="#201e1e"><ellipse cx="145" cy="156" rx="9" ry="20"/><ellipse cx="175" cy="156" rx="9" ry="20"/></g></svg>';
+    return '<svg class="nv-jmini" viewBox="56 50 208 200" aria-hidden="true"><path d="' + PET_STAR + '" fill="#F5D014"/><g fill="#201e1e"><ellipse cx="145" cy="156" rx="9" ry="20"/><ellipse cx="175" cy="156" rx="9" ry="20"/></g></svg>';
   }
   function jstar(mood) {
     var e = PET_EYES[mood] || PET_EYES.neutral, L = typeof e === "string" ? e : e[0], R = typeof e === "string" ? e : e[1];
     // Eyes centred on the star, with a light glance (4px) toward the bubble when they are open; lines stay centred.
     var flat = /sleepy|love/.test(mood), dx = flat || mood === "suspicious" ? 0 : 4, dy = flat ? 6 : mood === "suspicious" ? 1 : -4;
-    return '<svg class="nv-star m-' + mood + '" viewBox="56 50 208 200" aria-hidden="true"><path d="' + PET_STAR + '" fill="#fd6100"/><g class="je"><g transform="translate(' + (145 + dx) + " " + (160 + dy) + ')">' + L + '</g><g transform="translate(' + (175 + dx) + " " + (160 + dy) + ')">' + R + "</g></g>"
+    return '<svg class="nv-star m-' + mood + '" viewBox="56 50 208 200" aria-hidden="true"><path d="' + PET_STAR + '" fill="#F5D014"/><g class="je"><g transform="translate(' + (145 + dx) + " " + (160 + dy) + ')">' + L + '</g><g transform="translate(' + (175 + dx) + " " + (160 + dy) + ')">' + R + "</g></g>"
       // Sleepy (owner, 2026-11-04): a small "z Z" drifting up over the head.
       + (mood === "sleepy" ? '<g class="zz"><text class="z1" x="206" y="100">z</text><text class="z2" x="226" y="72">Z</text></g>' : "") + "</svg>";
   }
