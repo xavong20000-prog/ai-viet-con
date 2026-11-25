@@ -27,7 +27,7 @@
 
 ; AI Viet Con: repo GitHub cua anh (doi khi da tao repo, hoac /DRepoUrl=...)
 #ifndef RepoUrl
-  #define RepoUrl "https://github.com/YOUR-GITHUB/ai-viet-con.git"
+  #define RepoUrl "https://github.com/xavong20000-prog/ai-viet-con.git"
 #endif
 #define RepoWeb Copy(RepoUrl, 1, Len(RepoUrl) - 4)
 

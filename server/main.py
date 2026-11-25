@@ -18117,7 +18117,7 @@ async def config():
 # ============================================
 # Phiên bản + cập nhật trong UI
 # ============================================
-GITHUB_REPO = "YOUR-GITHUB/ai-viet-con"   # AI Viet Con: repo cua anh
+GITHUB_REPO = "xavong20000-prog/ai-viet-con"   # AI Viet Con: repo cua anh
 _UPDATE_TASKS = set()   # giữ ref mạnh cho asyncio.create_task (tránh GC nuốt mất task)
 
 

@@ -358,7 +358,7 @@ def drop_update_stash(stash_oid, restored):
 
 def release_source():
     """The same official release branch that /version checks in main.py."""
-    return "https://github.com/YOUR-GITHUB/ai-viet-con.git", "main"   # AI Viet Con: repo cua anh
+    return "https://github.com/xavong20000-prog/ai-viet-con.git", "main"   # AI Viet Con: repo cua anh
 
 
 def _clean_tracked_tree():

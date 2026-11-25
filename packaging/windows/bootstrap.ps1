@@ -28,7 +28,7 @@
 # ============================================================
 param(
   [string]$Dir = (Join-Path $env:USERPROFILE "AIVietCon"),
-  [string]$Repo = "https://github.com/YOUR-GITHUB/ai-viet-con.git",
+  [string]$Repo = "https://github.com/xavong20000-prog/ai-viet-con.git",
   [string]$Bundle = (Join-Path $PSScriptRoot "aivietcon.bundle"),   # ma nguon dong goi san trong bo cai
   [string]$Branch = "main",
   [string]$LogFile = "",

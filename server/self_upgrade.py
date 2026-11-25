@@ -37,7 +37,7 @@ from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from config import STATE_DIR
 
-SOURCE_REPO = "YOUR-GITHUB/ai-viet-con"        # the repo every install updates from (updater.release_source)
+SOURCE_REPO = "xavong20000-prog/ai-viet-con"        # the repo every install updates from (updater.release_source)
 STORE_DIR = STATE_DIR / "self_upgrade"
 OWNER_SCHEDULED = ("kanban", "reminder")     # background work the owner set up runs with the owner's word
 MAX_CHARS = 200_000

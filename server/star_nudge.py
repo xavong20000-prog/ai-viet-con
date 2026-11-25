@@ -21,7 +21,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-REPO = "YOUR-GITHUB/ai-viet-con"
+REPO = "xavong20000-prog/ai-viet-con"
 REPO_URL = "https://github.com/" + REPO
 API_URL = "https://api.github.com/repos/" + REPO
 
