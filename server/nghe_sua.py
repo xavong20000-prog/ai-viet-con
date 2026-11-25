@@ -292,7 +292,7 @@ def _ten_rieng_hai_chu(toks, i, n, s, term) -> bool:
 
 # Ca nghe nhầm ĐÃ BIẾT, sửa theo đúng chính tả, không cần so âm. Tên AI Việt Côn hay bị máy nghe ra
 # "Jarvis" (2026-11-06, chủ dự án báo: nói "AI Việt Côn" mà chép thành "Jarvis OS").
-KNOWN_MISHEARINGS = (("Jarvis OS", "AI Việt Côn"), ("Jarvis", "Javis"))
+KNOWN_MISHEARINGS = (("Jarvis OS", "AI Việt Côn"),)
 _KNOWN_MISHEARINGS_RE = [(re.compile(r"(?<!\w)" + re.escape(a) + r"(?!\w)", re.IGNORECASE), b)
                  for a, b in KNOWN_MISHEARINGS]
 
